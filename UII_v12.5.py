@@ -2460,21 +2460,7 @@ class MentatTriad:
                 # Existing termination conditions unchanged
                 gradient = self.phi_field.gradient(self.state, self.trace, log.crk_violations)
                 gradient_magnitude = np.sqrt(sum(g**2 for g in gradient.values()))
-                
-                if gradient_magnitude < 0.001:
-                    if verbose:
-                        print(f"\n{'='*70}")
-                        print(f"[GRADIENT COLLAPSE] ∇Φ magnitude: {gradient_magnitude:.6f}")
-                        print(f"{'='*70}")
-                    break
-                
-                if log.phi_after < -1.0:
-                    if verbose:
-                        print(f"\n{'='*70}")
-                        print(f"[PHI COLLAPSE] Φ={log.phi_after:.3f}")
-                        print(f"{'='*70}")
-                    break
-                
+                                
                 # NEW v12.5: Death clock termination
                 if self.death_clock_termination:
                     break
@@ -2644,6 +2630,7 @@ if __name__ == "__main__":
     print(f"  Final degradation: {report['death_clock_degradation_final']:.1%}")
     
     reality.close()
+
 
 
 
