@@ -83,11 +83,7 @@ A Groq API key is required for the Relation leg. The free tier works but hits da
 
 ---
 
-## Quick start
 
-See [QUICKSTART.md](QUICKSTART.md).
-
----
 
 ## License
 
