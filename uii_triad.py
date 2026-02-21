@@ -211,13 +211,20 @@ class MentatTriad:
             S=genome.S_bias,
             I=genome.I_bias,
             P=genome.P_bias,
-            A=genome.A_bias
+            A=genome.A_bias  # placeholder only — A is derived from genome geometry
+                             # and overwritten by _compute_a() on the first micro-batch.
+                             # A_bias and phi_coherence_weight are now deprecated in
+                             # LAYER1_PARAMS — pending genome structure cleanup.
         )
         self.state.smo.rigidity = genome.rigidity_init
 
         self.trace = StateTrace()
 
-        self.phi_field = PhiField(A0=genome.phi_coherence_weight)
+        # A0=1.0: A is now a derived measurement where 1.0 means system is in its
+        # inherited attractor basin. The strain term β(A - 1.0)² creates gravitational
+        # pull back toward basin geometry. This is structural, not a designer constant —
+        # the target is always "in the inherited basin."
+        self.phi_field = PhiField(A0=1.0)
 
         self.crk = CRKMonitor()
 
@@ -408,6 +415,61 @@ class MentatTriad:
         user_agent = AVAILABLE_AGENTS['user']
         user_agent.respond(self.triad_id, answer)
 
+    def _compute_a(self) -> float:
+        """
+        A as derived measurement of basin drift — not an environmental delta.
+
+        Two reality-grounded, genome-referenced signals:
+
+        1. Basin distance: Euclidean distance between current [S, I, P] and the
+           inherited genome basin center [S_bias, I_bias, P_bias], normalized to [0,1].
+           The genome center is where selection pressure found coherent geometry.
+           Distance zero = system resting in inherited basin.
+
+        2. Coupling divergence: Frobenius norm of (live coupling matrix - inherited
+           coupling matrix), normalized by inherited matrix norm. Measures how much
+           the observed co-movement of S/I/P has drifted from the basin's inherited
+           shape. Weighted by coupling confidence — low-confidence inherited matrix
+           contributes less to divergence.
+
+        A = 1 - drift, where drift combines both signals.
+        A near 1.0: system is in its inherited attractor basin.
+        A near 0.0: system has drifted far from coherent geometry.
+
+        No designer constants. Both signals are genome-referenced and
+        reality-measured. The reference point evolves with the genome.
+        """
+        # --- Signal 1: Basin distance ---
+        s_dist = self.state.S - self.genome.S_bias
+        i_dist = self.state.I - self.genome.I_bias
+        p_dist = self.state.P - self.genome.P_bias
+        # Normalize by max possible distance in [0,1]^3 space
+        basin_distance = float(np.sqrt(s_dist**2 + i_dist**2 + p_dist**2) / np.sqrt(3.0))
+
+        # --- Signal 2: Coupling divergence ---
+        coupling_divergence = 0.0
+        inherited_entry = self.genome.causal_model.get('coupling_matrix', {})
+        coupling_confidence = inherited_entry.get('confidence', 0.0)
+
+        if coupling_confidence > 0.0 and 'matrix' in inherited_entry:
+            inherited_matrix = np.array(inherited_entry['matrix'])
+            live_matrix = self.coupling_estimator.matrix
+
+            inherited_norm = float(np.linalg.norm(inherited_matrix, 'fro'))
+            if inherited_norm > 1e-6:
+                diff_norm = float(np.linalg.norm(live_matrix - inherited_matrix, 'fro'))
+                # Relative divergence, weighted by how confident the inherited matrix is
+                coupling_divergence = (diff_norm / inherited_norm) * coupling_confidence
+
+        # --- Combine: drift weighted by coupling availability ---
+        # When coupling confidence is low, basin_distance dominates.
+        # When coupling confidence is high, both contribute equally.
+        drift = (basin_distance * (1.0 - 0.5 * coupling_confidence) +
+                 coupling_divergence * 0.5 * coupling_confidence)
+
+        drift = float(np.clip(drift, 0.0, 1.0))
+        return 1.0 - drift
+
     def step(self, verbose: bool = False) -> StepLog:
         """
         v13.2: Attractor monitoring + affordance expansion at freeze_verified.
@@ -459,7 +521,12 @@ class MentatTriad:
 
             predicted_delta = self.reality_engine.predict_delta(action, self.state)
 
-            observed_delta, context = self.reality.execute(action, boundary_pressure=boundary_pressure)
+            observed_delta, context = self.reality.execute(
+                action,
+                boundary_pressure=boundary_pressure,
+                state=self.state,
+                coupling_confidence=self.coupling_estimator.get_confidence(),
+            )
 
             self.state.apply_delta(observed_delta, predicted_delta)
             self.trace.record(self.state)
@@ -745,12 +812,17 @@ class MentatTriad:
                 if verbose:
                     print(f"\n[COMMITMENT] All trajectories failed - fallback observe")
 
-                delta, context = self.reality.execute({'type': 'observe', 'params': {}})
+                delta, context = self.reality.execute(
+                    {'type': 'observe', 'params': {}},
+                    state=self.state,
+                    coupling_confidence=self.coupling_estimator.get_confidence(),
+                )
                 self.state.apply_delta(delta)
                 self.trace.record(self.state)
-            else:
-                self.trajectories_committed += 1
+                # No virtual/real delta to record — no trajectory was committed.
+                # ModelFidelityMonitor only tracks committed trajectories.
 
+            else:
                 # v14.1: Record virtual vs real Φ delta for ModelFidelityMonitor
                 if self.trajectory_lab.virtual_mode_enabled:
                     virtual_phi = getattr(best_trajectory, 'virtual_phi', None)
@@ -779,7 +851,11 @@ class MentatTriad:
                 else:
                     if verbose:
                         print(f"  ✗ Re-execution failed, falling back")
-                    delta, context = self.reality.execute({'type': 'observe', 'params': {}})
+                    delta, context = self.reality.execute(
+                        {'type': 'observe', 'params': {}},
+                        state=self.state,
+                        coupling_confidence=self.coupling_estimator.get_confidence(),
+                    )
                     self.state.apply_delta(delta)
                     self.trace.record(self.state)
 
@@ -825,6 +901,11 @@ class MentatTriad:
         self.model_fidelity_monitor.record_action_error(recent_mse)
 
         # Phase 5: Post-batch state
+        # A is a derived measurement of basin drift — computed from genome geometry,
+        # not accumulated from environmental deltas. Recomputed after each micro-batch
+        # so CRK and Phi evaluations below see the current drift value.
+        self.state.A = self._compute_a()
+
         violations_after = self.crk.evaluate(self.state, self.trace, None)
         phi_after = self.phi_field.phi(self.state, self.trace, violations_after)
         state_after = self.state.as_dict()

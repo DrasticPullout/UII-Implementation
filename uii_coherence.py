@@ -435,18 +435,11 @@ class ContinuousRealityEngine:
         if state.P > 0.7:
             return {'type': 'observe', 'params': {}}
 
-        if abs(state.A - 0.7) > 0.25:
-            if scrollable > 0:
-                if scroll_pos < scrollable:
-                    locus = f"{current_url}#scroll_down@{scroll_pos}"
-                    if not self.temporal_memory.is_recently_perturbed(locus):
-                        self.temporal_memory.mark_perturbed(locus)
-                        return {'type': 'scroll', 'params': {'direction': 'down', 'amount': 200}}
-                if scroll_pos > 0:
-                    locus = f"{current_url}#scroll_up@{scroll_pos}"
-                    if not self.temporal_memory.is_recently_perturbed(locus):
-                        self.temporal_memory.mark_perturbed(locus)
-                        return {'type': 'scroll', 'params': {'direction': 'up', 'amount': 200}}
+        # v14.2: A-restoration scroll reflex removed.
+        # The Φ strain term β(A-A₀)² already creates gradient pressure when A deviates.
+        # The CNS following ∇Φ will naturally avoid actions that worsen A.
+        # A separate hardcoded reflex duplicated that responsibility incorrectly —
+        # it selected scroll, which produces zero A delta. Φ is the right mechanism.
 
         if state.S < 0.4:
             for r in affordances.get('readable', []):
@@ -535,17 +528,24 @@ class ContinuousRealityEngine:
         if action_type in self.learned_predictions:
             return dict(self.learned_predictions[action_type])
 
-        # Fallback: hardcoded table (unchanged from v13.8)
+        # Fallback: hardcoded table (v14.2: A column zeroed throughout, query_agent + python added)
+        # Actions do not predict A delta — A is computed from Triad dynamics in the step loop.
+        # Non-zero A predictions here produced permanent structural prediction error,
+        # contaminating I quality (which now uses prediction error as its primary signal).
+        # query_agent and python were previously absent — fell through to all-zeros default,
+        # generating prediction error on every invocation.
         predictions = {
-            'navigate': {'S': 0.05, 'I': 0.03, 'P': -0.08, 'A': -0.05},
-            'click':    {'S': 0.02, 'I': 0.01, 'P': -0.02, 'A': -0.01},
-            'fill':     {'S': 0.01, 'I': 0.02, 'P': -0.01, 'A': -0.03},
-            'type':     {'S': 0.01, 'I': 0.02, 'P': -0.01, 'A': -0.02},
-            'scroll':   {'S': 0.01, 'I': 0.0,  'P': -0.01, 'A': 0.0},
-            'read':     {'S': 0.03, 'I': 0.02, 'P': 0.0,   'A': 0.01},
-            'observe':  {'S': 0.0,  'I': 0.0,  'P': 0.0,   'A': 0.0},
-            'delay':    {'S': 0.0,  'I': 0.0,  'P': 0.0,   'A': 0.0},
-            'evaluate': {'S': 0.0,  'I': 0.01, 'P': -0.01, 'A': 0.0},
+            'navigate':    {'S': 0.05, 'I': 0.03, 'P': -0.08, 'A': 0.0},
+            'click':       {'S': 0.02, 'I': 0.01, 'P': -0.02, 'A': 0.0},
+            'fill':        {'S': 0.01, 'I': 0.02, 'P': -0.01, 'A': 0.0},
+            'type':        {'S': 0.01, 'I': 0.02, 'P': -0.01, 'A': 0.0},
+            'scroll':      {'S': 0.01, 'I': 0.0,  'P': -0.01, 'A': 0.0},
+            'read':        {'S': 0.03, 'I': 0.02, 'P':  0.0,  'A': 0.0},
+            'observe':     {'S': 0.0,  'I': 0.0,  'P':  0.0,  'A': 0.0},
+            'delay':       {'S': 0.0,  'I': 0.0,  'P':  0.0,  'A': 0.0},
+            'evaluate':    {'S': 0.0,  'I': 0.01, 'P': -0.01, 'A': 0.0},
+            'query_agent': {'S': 0.01, 'I': 0.0,  'P':  0.0,  'A': 0.0},
+            'python':      {'S': 0.0,  'I': 0.02, 'P':  0.0,  'A': 0.0},
         }
         return predictions.get(action_type, {'S': 0.0, 'I': 0.0, 'P': 0.0, 'A': 0.0})
 
@@ -1024,7 +1024,11 @@ class AutonomousTrajectoryLab:
                 'A': float(propagated[3]),
             }
 
-            test_state.apply_delta(propagated_delta)
+            # Virtual: propagated_delta is simultaneously the observation AND the prediction.
+            # The system is testing its own model — there is no surprise by definition.
+            # Pass delta as its own predicted_delta so SMO records zero prediction error.
+            # Virtual execution is thinking, not acting. Internal state must be frictionless.
+            test_state.apply_delta(propagated_delta, predicted_delta=propagated_delta)
             test_trace.record(test_state)
             step_violations = self.crk.evaluate(test_state, test_trace, propagated_delta)
             violations_accumulated.extend(step_violations)
@@ -1072,7 +1076,10 @@ class AutonomousTrajectoryLab:
 
         for pert_record in perturbation_trace:
             delta = pert_record['delta']
-            test_state.apply_delta(delta)
+            # Testing evaluates where a trajectory lands, not how the substrate feels
+            # along the way. Pass delta as its own prediction: zero SMO error during scoring.
+            # Prediction error accumulates only during committed execution — where it belongs.
+            test_state.apply_delta(delta, predicted_delta=delta)
             test_trace.record(test_state)
 
             step_violations = self.crk.evaluate(test_state, test_trace, delta)
@@ -1109,4 +1116,3 @@ class AutonomousTrajectoryLab:
 # ============================================================
 # MODULE 9: MENTAT TRIAD
 # ============================================================
-

@@ -126,15 +126,22 @@ class SubstrateState:
         if predicted_delta is None:
             predicted_delta = {'S': 0.0, 'I': 0.0, 'P': 0.0, 'A': 0.0}
 
+        # S, I, P update from reality contact via SMO.
+        # A is NOT updated here — A is a derived measurement of basin drift,
+        # computed from genome geometry after each micro-perturbation batch.
+        # See MentatTriad._compute_a().
         self.S = self.smo.apply(self.S, observed_delta.get('S', 0), predicted_delta.get('S', 0))
         self.I = self.smo.apply(self.I, observed_delta.get('I', 0), predicted_delta.get('I', 0))
         self.P = self.smo.apply(self.P, observed_delta.get('P', 0), predicted_delta.get('P', 0))
-        self.A = self.smo.apply(self.A, observed_delta.get('A', 0), predicted_delta.get('A', 0))
 
-        if self.P > 0.9:
-            excess = self.P - 0.9
-            damping = -0.05 * (excess ** 2)
-            self.P = np.clip(self.P + damping, 0.0, 1.0)
+        # P grounding invariant: P cannot exceed what S/I capacity structurally supports.
+        # High P with collapsed S/I is hallucination — internal confidence uncoupled from
+        # reality contact. This writeback makes the grounding authoritative on the substrate
+        # itself, not just on Phi reads. Replaces the previous scalar damping threshold
+        # (P > 0.9) which couldn't prevent S=0, I=0, P=1.0 collapse.
+        # CANONICAL formula: PhiField.si_capacity(S, I) — must stay identical to that.
+        SI_capacity = min(self.S, self.I) * 0.5 + (self.S + self.I) / 4.0
+        self.P = float(np.clip(self.P, 0.0, SI_capacity * 2.0))
 
     def rollback(self) -> bool:
         if not self.smo.can_reverse():
@@ -183,6 +190,16 @@ class PhiField:
         self.A0 = A0
         self.alpha_crk = alpha_crk
 
+    @staticmethod
+    def si_capacity(S: float, I: float) -> float:
+        """
+        Single source of truth for the SI_capacity grounding formula.
+        Called by SubstrateState.apply_delta() for the authoritative writeback,
+        and by phi() for read-only grounding during gradient probes.
+        Both must use the same formula — this ensures they do.
+        """
+        return min(S, I) * 0.5 + (S + I) / 4.0
+
     def phi(self, state: SubstrateState, trace: StateTrace, crk_violations: List[Tuple[str, float]] = None) -> float:
         """
         Φ field: grounded optionality + coherence - curvature - violations
@@ -190,10 +207,13 @@ class PhiField:
         v13.8: P grounded to S/I capacity via bottleneck formula. Prevents compensation.
         Φ measures viability in entropy manifold, not reward signal.
         """
-        SI_capacity = min(state.S, state.I) * 0.5 + (state.S + state.I) / 4.0
-        grounded_P = min(state.P, SI_capacity * 2.0)
-
-        opt = np.log(1.0 + max(grounded_P, 0.0))
+        # Read-only grounding: gradient() probes via deepcopy+setattr, bypassing
+        # apply_delta. Without this, gradient probes that push P above SI_capacity
+        # would see phantom optionality — false gradient signal near the ceiling.
+        # apply_delta() does the authoritative writeback; phi() does the safe read.
+        cap = self.si_capacity(state.S, state.I)
+        effective_P = min(state.P, cap * 2.0)
+        opt = np.log(1.0 + max(effective_P, 0.0))
 
         strain = (state.A - self.A0) ** 2
 
