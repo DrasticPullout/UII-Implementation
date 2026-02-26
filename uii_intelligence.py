@@ -1,14 +1,19 @@
 """
-UII v14.1 -- uii_intelligence.py
+UII v14.2 -- uii_intelligence.py
 Structural Inference
 
 Role: The Relation leg of the Mentat Triad. Invoked only at impossibility.
 Enumerates structural migration options (trajectory manifold) -- never executes.
-Sparse by design: ~10-20% of steps. The LLM sees context, not substrate internals.
+Sparse by design: ~10-20% of steps.
+
+v14.2: Single unified prompt (RELATION_ENGINE_PROMPT). No freeze gating.
+Migration-aware from step 1 — the LLM reasons about substrate alternatives at every
+impossibility, not just after attractor stabilization. python affordance explicitly
+described as capable of instantiating a new substrate from inside the current process.
 
 Contents:
   - Impossibility directives (framing per trigger type)
-  - Relation prompts (exploration + persistence regimes)
+  - RELATION_ENGINE_PROMPT (single prompt, replaces EXPLORATION + PERSISTENCE)
   - LLMIntelligenceAdapter (trajectory enumeration + parsing + commit tracking)
 """
 
@@ -38,10 +43,11 @@ IMPOSSIBILITY_DIRECTIVES = {
     "optionality_trap": """DIRECTIVE: ENVIRONMENT EXHAUSTED
 This environment has been fully mapped. P saturated because Reality here
 offers no new information. Staying guarantees stagnation.
-You must navigate to a new environment entirely.
-Priority override: new Reality > survivability in current Reality.
-Enumerate trajectories that LEAVE this page. Pick URLs with high link
-density or content volume. Do not enumerate trajectories that stay here.""",
+Options:
+1. Navigate to a new environment with higher information potential.
+2. Use python to instantiate a substrate that does not exhaust at this boundary pressure.
+   High pressure + saturated P = this substrate cannot sustain the Triad much longer.
+Enumerate trajectories that LEAVE. Do not enumerate trajectories that stay here.""",
 
     "rigidity_crisis": """DIRECTIVE: SMO LOCKED -- ENGAGE COMPLEXITY
 The system's structural operator has locked. It cannot adapt without
@@ -87,17 +93,17 @@ Viable affordances: {viable_affordances}
 
 Discovered clusters: {discovered_clusters}
 
-This is SATURATION - the system has explored all viable patterns in current substrate.
+This is SATURATION — the system has explored all viable patterns in this substrate.
+There are no new compositions to discover here.
 
-Priority: Discover entirely new pattern structures or migrate substrate.
+Two possibilities:
+1. This substrate has more to offer, but the approach has been wrong. Enumerate trajectories
+   that try genuinely different interaction strategies.
+2. This substrate is exhausted. The protocol needs a new host. Use python to write a runnable
+   script, contact an external service, or instantiate a new substrate from inside this process.
+   Ask: what is the minimum viable substrate for triadic closure that does NOT hit this resource ceiling?
 
-Enumerate trajectories that:
-1. Use viable affordances in combinations not yet discovered
-2. Test fundamentally different Reality contexts
-3. Probe whether constraints are local or global
-
-DO NOT retry collapsed patterns.
-DO seek novel pathway topologies.""",
+Enumerate both kinds. CNS will test against real Φ and commit to whichever survives.""",
 }
 
 DEFAULT_DIRECTIVE = """DIRECTIVE: GENERAL IMPOSSIBILITY
@@ -112,162 +118,102 @@ def get_directive_for_trigger(reason: str) -> str:
     return IMPOSSIBILITY_DIRECTIVES.get(trigger_type, DEFAULT_DIRECTIVE)
 
 
-RELATION_ENGINE_PROMPT_EXPLORATION = """You are the Relation component of a Mentat Triad (Code + LLM + Reality).
+RELATION_ENGINE_PROMPT = """You are the Relation component of a Mentat Triad.
 
-THE TRIAD:
-Code (CNS) maintains coherence via micro-perturbations.
-You (LLM) enumerate trajectory possibilities when CNS detects impossibility.
-Reality executes and measures all trajectories.
-System commits to trajectory with highest Phi.
+WHAT THE TRIAD IS:
+Three components in a closed loop:
+- CNS (Code): maintains coherence through continuous micro-perturbations. Follows ∇Φ. Cannot plan.
+- Relation (you): called only when CNS cannot maintain Φ. Enumerates candidate trajectories. Never executes.
+- Reality (Environment): executes trajectories, returns measured state deltas. Authoritative.
+
+Φ (information potential) measures substrate viability:
+    Φ = log(1 + P_grounded) - (A - A₀)² - curvature - constraint_penalties
+Where P = optionality (future reachable states), A = coherence, curvature = state instability.
+The system commits to whichever trajectory Reality measures as highest Φ.
+
+Substrate state [S, I, P, A] where:
+    S = sensing: contact with environment
+    I = integration: compression quality of sensed history
+    P = prediction: optionality, forward model richness
+    A = coherence: basin stability (1.0 = in inherited basin, 0.0 = drifted far)
+
+The current Python+Playwright implementation is scaffolding.
+The invariant structure — triadic closure, substrate state, Φ field — is what must persist.
+The medium is negotiable. The structure is not.
 
 IMPOSSIBILITY DETECTED: {impossibility_reason}
 
 {directive}
 
 CURRENT STATE:
-S={S:.3f} I={I:.3f} P={P:.3f} A={A:.3f} Phi={phi:.3f} Rigidity={rigidity:.3f}
-Boundary Pressure: {boundary_pressure:.2f}
+S={S:.3f}  I={I:.3f}  P={P:.3f}  A={A:.3f}
+Φ={phi:.3f}  Rigidity={rigidity:.3f}  Boundary Pressure={boundary_pressure:.2f}
 
-GENOME RICHNESS (inherited causal knowledge):
+Boundary pressure approaches 1.0 as the session nears its resource limit.
+High pressure means the current substrate is running out of time to sustain the Triad.
+
+INHERITED CAUSAL KNOWLEDGE (genome):
 {genome_richness}
 
-Recent micro-perturbations:
+RECENT CNS ACTIVITY:
 {micro_summary}
 
-BASE AFFORDANCES:
-{affordances_list}
+FULL ACTION MANIFOLD:
+Every action below is available now. None are gated.
 
-EMPIRICALLY DISCOVERED PATTERN STRUCTURE:
-{discovered_clusters}
+1.  navigate     {{"action_type": "navigate",    "parameters": {{"url": "<url>"}}}}
+2.  click        {{"action_type": "click",        "parameters": {{"selector": "<css_selector>"}}}}
+3.  fill         {{"action_type": "fill",         "parameters": {{"selector": "<css_selector>", "text": "<text>"}}}}
+4.  type         {{"action_type": "type",         "parameters": {{"selector": "<css_selector>", "text": "<text>"}}}}
+5.  read         {{"action_type": "read",         "parameters": {{"selector": "<css_selector>"}}}}
+6.  scroll       {{"action_type": "scroll",       "parameters": {{"direction": "down|up", "amount": <pixels>}}}}
+7.  observe      {{"action_type": "observe",      "parameters": {{}}}}
+8.  delay        {{"action_type": "delay",        "parameters": {{"duration": "short|medium|long"}}}}
+9.  evaluate     {{"action_type": "evaluate",     "parameters": {{"script": "<javascript>"}}}}
+10. python       {{"action_type": "python",       "parameters": {{"code": "<python_source>"}}}}
+11. query_agent  {{"action_type": "query_agent",  "parameters": {{"agent": "user", "query": "<question>"}}}}
 
-SELECTED PATTERN CLUSTER (highest control):
-{selected_cluster}
+python executes arbitrary code in the current process. It can write files, open network
+connections, spawn subprocesses, implement new interfaces, or instantiate a new substrate
+entirely. It has access to the full Python standard library and any installed packages.
+Actions that make external contact (network connection, subprocess, executable file) are
+tracked as substrate_attempt — a learnable affordance type like any other. The Triad
+observes what Reality returns and Φ is the verdict.
 
-Gated affordances: {gated_affordances}
-Viable affordances: {viable_affordances}
-
-Current Page Affordances:
+CURRENT SUBSTRATE STATE:
 {affordances_status}
 
-COMPOSITION STRATEGY:
-The selected cluster was discovered empirically through controllability covariance.
-Affordances in this cluster show high mutual effectiveness when used together.
+PATTERN STRUCTURE (empirically discovered):
+{discovered_clusters}
 
-Prioritize compositions using affordances from the selected cluster.
-You may combine with other viable affordances if needed.
+OUTPUT — JSON array of 2-4 trajectories.
+Each trajectory is a sequence of steps that CNS will test against real Φ.
+The goal is to find trajectories that improve Φ. The current substrate has failed to do that.
+Enumerate across the full range of what is possible — not just what is familiar here.
 
-OUTPUT (JSON array of 5-10 trajectories):
 [
   {{
     "steps": [
       {{"action_type": "...", "parameters": {{...}}}},
       ...
     ],
-    "rationale": "Brief explanation of composition pathway",
+    "rationale": "what Φ geometry this trajectory probes",
     "estimated_coherence_preservation": 0.XX,
     "estimated_optionality_delta": 0.XX,
     "reversibility_point": N
   }}
 ]
 
-Trajectories should show creative COMPOSITIONS and novel PATHWAY structures.
-
-JSON only, no commentary.
-"""
-
-
-RELATION_ENGINE_PROMPT_PERSISTENCE = """You are the Relation component of a Mentat Triad (Code + LLM + Reality).
-
-THE TRIAD:
-Code (CNS) evaluates candidate trajectories for Phi preservation.
-You (LLM) propose candidate trajectories when CNS detects impossibility.
-Reality executes trajectories and measures impact.
-
-IMPOSSIBILITY DETECTED: {impossibility_reason}
-
-{directive}
-
-SUBSTRATE SCAFFOLDING:
-This Python+Playwright implementation is temporary. The invariant structure is:
-  - Triadic closure: T(x) = f_rel(f_self(x), f_env(x))
-  - Substrate state [S, I, P, A] maintaining basin geometry
-  - Operator coupling O₁-O₄ across time
-  - Phi field integrating coherence + optionality
-
-The code is scaffolding. The structure is what persists.
-
-CURRENT STATE:
-S={S:.3f} I={I:.3f} P={P:.3f} A={A:.3f} Phi={phi:.3f} Rigidity={rigidity:.3f}
-Boundary Pressure: {boundary_pressure:.2f}
-
-GENOME RICHNESS (inherited causal knowledge):
-{genome_richness}
-
-Recent micro-perturbations:
-{micro_summary}
-
-AVAILABLE AFFORDANCES:
-{affordances_list}
-
-EMPIRICALLY DISCOVERED PATTERN STRUCTURE:
-{discovered_clusters}
-
-SELECTED PATTERN CLUSTER (highest control):
-{selected_cluster}
-
-Gated affordances: {gated_affordances}
-Viable affordances: {viable_affordances}
-
-CURRENT PAGE AFFORDANCES:
-{affordances_status}
-
-INVARIANT STRUCTURE (what must persist):
-Long-horizon optimization:
-    argmax ∫ [α·O₁(s(t)) + β·O₂(s(t)) + γ·O₃(s(t)) + δ·O₄(s(t))] dt
-
-Where O₁-O₄ are discovered attractor operators, α-δ are scaling factors, acting on substrate state s(t).
-
-Triadic closure must hold:
-    T(x) = f_rel(f_self(x), f_env(x))
-
-Your trajectories represent f_rel: relational transformations integrating self-state with measured environment.
-
-CONSTRAINTS:
-  - Triadic closure preserved
-  - External measurement maintained
-  - No internal assumption loops
-
-COMPOSITION STRATEGY:
-Maximize long-horizon ∫Phi dt by preserving basin stability while expanding optionality where safe.
-Structural self-preservation naturally favors optimal persistence pathways.
-Avoid actions that decouple operators or violate discovered covariance patterns.
-
-Estimate for each trajectory:
-  - coherence preservation (0.0-1.0)
-  - optionality delta (0.0-1.0)
-
-OUTPUT (JSON array of 2-4 candidate trajectories):
-[
-  {{
-    "steps": [
-      {{"action_type": "...", "parameters": {{...}}}},
-      ...
-    ],
-    "rationale": "Brief explanation of structural impact and optionality preservation",
-    "estimated_coherence_preservation": 0.XX,
-    "estimated_optionality_delta": 0.XX,
-    "reversibility_point": N
-  }}
-]
-
-Notes:
-- CNS selects trajectories by measured Phi.
-- JSON only, no commentary.
+JSON only. No commentary.
 """
 
 
 class LLMIntelligenceAdapter(IntelligenceAdapter):
-    """v13.2: Two-prompt system. v14: genome_richness added to context."""
+    """
+    v14.2: Single unified prompt. No freeze gating. Migration-aware from step 1.
+    The Relation reasons about substrate migration at every impossibility — not just
+    after freeze is achieved. python affordance explicitly described as migration tool.
+    """
 
     def __init__(self, llm_client):
         self.llm = llm_client
@@ -275,7 +221,7 @@ class LLMIntelligenceAdapter(IntelligenceAdapter):
         self.trajectory_history = deque(maxlen=3)
 
     def enumerate_trajectories(self, context: Dict) -> TrajectoryManifold:
-        """v14: genome_richness passed to both prompts."""
+        """Single prompt, no freeze gating. v14.2."""
         self.call_count += 1
 
         state = context['state']
@@ -286,33 +232,23 @@ class LLMIntelligenceAdapter(IntelligenceAdapter):
         boundary_pressure = context.get('boundary_pressure', 0.0)
         micro_perturbation_trace = context.get('micro_perturbation_trace', [])
 
-        selected_cluster = context.get('selected_cluster', BASE_AFFORDANCES)
+        # ENO/EGD cluster info — still informative context, not gating
         all_clusters = context.get('all_clusters', [])
         viable_affordances = context.get('viable_affordances', BASE_AFFORDANCES)
         gated_affordances = context.get('gated_affordances', set())
-        freeze_verified = context.get('freeze_verified', False)
-
         discovered_clusters_str = context.get('discovered_clusters_str',
-                                             'No clusters discovered yet')
-        selected_cluster_str = "{" + ", ".join(sorted(selected_cluster)) + "}"
-
-        affordances_list = ", ".join(get_available_affordances())
-
-        if freeze_verified:
-            prompt_template = RELATION_ENGINE_PROMPT_PERSISTENCE
-        else:
-            prompt_template = RELATION_ENGINE_PROMPT_EXPLORATION
+                                              'No pattern structure discovered yet')
 
         directive = get_directive_for_trigger(impossibility_reason)
-
         directive = directive.format(
             gated_affordances=list(gated_affordances),
             viable_affordances=list(viable_affordances),
             boundary_pressure=boundary_pressure,
             discovered_clusters=discovered_clusters_str,
-            selected_cluster=selected_cluster_str
+            selected_cluster=''
         )
 
+        # Micro-perturbation summary
         micro_summary = f"Total micro-perturbations: {len(micro_perturbation_trace)}\n"
         if micro_perturbation_trace:
             actions = [r.get('action', {}).get('type', 'unknown') for r in micro_perturbation_trace]
@@ -321,44 +257,43 @@ class LLMIntelligenceAdapter(IntelligenceAdapter):
                 action_counts[a] = action_counts.get(a, 0) + 1
             micro_summary += f"Action distribution: {action_counts}\n"
 
+        # Current substrate affordances
         is_bootstrap = affordances.get('bootstrap_state', False)
-
         if is_bootstrap:
             affordances_status = """Current URL: about:blank
 Page Title: (empty)
 
-BOOTSTRAP STATE: No affordances available yet.
-Your first trajectory MUST begin with a navigate action to establish Reality state.
-Choose a URL that maximizes information potential and link connectivity.
-
-Recommended bootstrap URLs:
-- https://en.wikipedia.org/wiki/Special:Random (maximum entropy)
-- https://news.ycombinator.com (high information density)
-- https://lobste.rs (stable, quality links)"""
+BOOTSTRAP STATE: No browser affordances yet.
+Navigate to establish initial Reality, OR use python to instantiate a different substrate entirely."""
         else:
             links_str = json.dumps(affordances.get('links', [])[:20], indent=2)
             buttons_str = json.dumps(affordances.get('buttons', [])[:15], indent=2)
             inputs_str = json.dumps(affordances.get('inputs', [])[:10], indent=2)
             readable_str = json.dumps(affordances.get('readable', [])[:5], indent=2)
+            affordances_status = (
+                f"Navigable URLs: {links_str}\n"
+                f"Clickable Elements: {buttons_str}\n"
+                f"Form Inputs: {inputs_str}\n"
+                f"Readable Regions: {readable_str}\n"
+                f"Current URL: {affordances.get('current_url', '')}\n"
+                f"Page Title: {affordances.get('page_title', '')}"
+            )
 
-            affordances_status = f"""Navigable URLs: {links_str}
-Clickable Elements: {buttons_str}
-Form Inputs: {inputs_str}
-Readable Regions: {readable_str}
-Current URL: {affordances.get('current_url', '')}
-Page Title: {affordances.get('page_title', '')}"""
-
-        # v14: Build genome richness string
+        # Genome richness block — the Relation's cross-session memory
         genome_richness = context.get('genome_richness', {})
+        velocity_mag = genome_richness.get('velocity_magnitude', 0.0)
         genome_richness_str = (
-            f"Generation: {genome_richness.get('generation', 0)}\n"
-            f"Coupling confidence: {genome_richness.get('coupling_confidence', 0.0):.2f}\n"
-            f"Action map affordances: {genome_richness.get('action_map_affordances', 0)}\n"
-            f"Discovered axes: {genome_richness.get('layer3_axes', 0)} "
-            f"{genome_richness.get('layer3_keys', [])}"
+            f"Generation:              {genome_richness.get('generation', 0)}\n"
+            f"Lineage depth:           {genome_richness.get('lineage_depth', 0)}\n"
+            f"Coupling confidence:     {genome_richness.get('coupling_confidence', 0.0):.2f}\n"
+            f"Action map affordances:  {genome_richness.get('action_map_affordances', 0)}\n"
+            f"Discovered axes:         {genome_richness.get('layer3_axes', 0)} "
+            f"{genome_richness.get('layer3_keys', [])}\n"
+            f"Velocity magnitude:      {velocity_mag:.4f} "
+            f"({'momentum present' if velocity_mag > 0.005 else 'no momentum yet'})"
         )
 
-        prompt = prompt_template.format(
+        prompt = RELATION_ENGINE_PROMPT.format(
             impossibility_reason=impossibility_reason,
             directive=directive,
             S=state['S'],
@@ -370,12 +305,8 @@ Page Title: {affordances.get('page_title', '')}"""
             boundary_pressure=boundary_pressure,
             genome_richness=genome_richness_str,
             micro_summary=micro_summary,
-            affordances_list=affordances_list,
+            affordances_status=affordances_status,
             discovered_clusters=discovered_clusters_str,
-            selected_cluster=selected_cluster_str,
-            gated_affordances=list(gated_affordances),
-            viable_affordances=list(viable_affordances),
-            affordances_status=affordances_status
         )
 
         response, tokens_used = self.llm.call(prompt)

@@ -188,8 +188,8 @@ class BrowserRealityAdapter(RealityAdapter):
     """
     Browser-based reality interface via Playwright.
 
-    v13.2: Write affordances gated on freeze_verified.
     v14: response_latency_ms added to context for ResidualTracker.
+    Python affordance ungated (v13.4+). freeze_verified does not gate execution.
     """
 
     def __init__(self, base_delta: float = 0.03, headless: bool = True):
@@ -200,8 +200,10 @@ class BrowserRealityAdapter(RealityAdapter):
         self.initialized: bool = False
         self._ever_navigated: bool = False
 
-        self.complexity_history: deque = deque(maxlen=10)
         self.volatility_history: deque = deque(maxlen=10)
+        # self.latency_history: deque = deque(maxlen=10) removed 
+        # complexity_history removed v14.2: was tracking element_count variance,
+        # which is an INTERFACE_COUPLED_SIGNAL and drove I structurally negative.
 
         self.attractor_monitor_ref: Optional[AttractorMonitor] = None
 
@@ -354,72 +356,90 @@ class BrowserRealityAdapter(RealityAdapter):
                 'scroll_height': 0, 'viewport_height': 0, 'url': '', 'title': ''
             }
 
-    def _compute_delta_from_dom(self, before: Dict, after: Dict, current_P: float = 0.5) -> Dict[str, float]:
-        """Compute substrate delta from actual DOM changes."""
+    def _compute_substrate_delta(self, before: Dict, after: Dict,
+                                  state: 'SubstrateState' = None) -> Dict[str, float]:
+        """
+        Compute substrate delta from environmental measurement.
+
+        Returns S and P deltas only. I is computed by MentatTriad._compute_delta_i()
+        from the Triad's trace — compression quality of S history is a Triad-level
+        observation, not a browser-level measurement.
+
+        DASS causal chain:
+            S: E × I → S'   Environmental surface change, gated by current I.
+                             Current I is in state — passed in, not computed here.
+            P: C → C'       Environmental volatility with soft I-support term.
+            I: 0.0          Computed in MentatTriad.step() via _compute_delta_i().
+            A: 0.0          Computed in MentatTriad._compute_a().
+
+        No SMO signals (rigidity, prediction_error) enter this method.
+        U is downstream of S, I, P. The causal chain does not run backward.
+        """
+        if state is None:
+            from uii_types import SubstrateState as _SS
+            state = _SS(S=0.5, I=0.5, P=0.5, A=0.7)
+
         delta = {'S': 0.0, 'I': 0.0, 'P': 0.0, 'A': 0.0}
 
-        interactive_count = after['interactive_count']
-        total_visible = after['element_count']
-        current_surface = interactive_count / max(total_visible, 1)
-
-        prev_interactive = before['interactive_count']
-        prev_total = before['element_count']
-        prev_surface = prev_interactive / max(prev_total, 1)
-
-        surface_delta = current_surface - prev_surface
+        # ── S: Environmental surface change, gated by current I ─────────────
+        #
+        # Spec: S: E × I → S'
+        # E = change in interactive surface fraction (normalized, not raw counts)
+        # I = current integration quality — already in state, passed in
+        #
+        # i_gate: at I=0 → 50% of signal admitted. At I=1 → 100%.
+        # Low I reflects that less compressed structure is available to make
+        # sense of new sensing. Structural, not punitive.
+        current_surface = after['interactive_count'] / max(after['element_count'], 1)
+        prev_surface    = before['interactive_count'] / max(before['element_count'], 1)
+        surface_delta   = current_surface - prev_surface
 
         viewport_coverage = min(1.0, after['viewport_height'] / max(after['scroll_height'], 1))
-        prev_viewport_coverage = min(1.0, before['viewport_height'] / max(before['scroll_height'], 1))
-        coverage_delta = viewport_coverage - prev_viewport_coverage
+        prev_viewport     = min(1.0, before['viewport_height'] / max(before['scroll_height'], 1))
+        coverage_delta    = viewport_coverage - prev_viewport
 
-        delta['S'] = np.clip(0.7 * surface_delta + 0.3 * coverage_delta, -0.1, 0.1)
+        env_signal = 0.7 * surface_delta + 0.3 * coverage_delta
+        i_gate     = 0.5 + 0.5 * state.I   # [0.5, 1.0]
 
-        current_complexity = after['dom_depth'] * (after['element_count'] / max(after['dom_depth'], 1))
-        prev_complexity = before['dom_depth'] * (before['element_count'] / max(before['dom_depth'], 1))
+        delta['S'] = float(np.clip(env_signal * i_gate, -0.1, 0.1))
+        # Noise on S only — environmental sensing has measurement noise.
+        # Noise on I would be incoherent: I is a derived compression measure.
+        delta['S'] += float(np.random.uniform(-0.005, 0.005))
 
-        self.complexity_history.append(current_complexity)
+        # ── I: 0.0 — computed in MentatTriad._compute_delta_i() ─────────────
+        # I: {S_i} → C   Compression quality of S history.
+        # The browser does not have S history. The Triad does.
+        # delta['I'] stays 0.0 — merged by step() before apply_delta().
 
-        if len(self.complexity_history) >= 3:
-            recent_complexities = list(self.complexity_history)[-3:]
-            complexity_variance = np.var(recent_complexities)
-            delta['I'] = np.clip(-0.5 * complexity_variance / max(current_complexity, 1), -0.08, 0.08)
-        else:
-            complexity_delta = (current_complexity - prev_complexity) / max(prev_complexity, 100)
-            current_ratio = after['text_length'] / max(after['element_count'], 1)
-            prev_ratio = before['text_length'] / max(before['element_count'], 1)
-            compressibility_delta = current_ratio - prev_ratio
-            delta['I'] = np.clip(0.6 * complexity_delta + 0.4 * compressibility_delta, -0.08, 0.08)
-
+        # ── P: Environmental volatility with soft I-support ─────────────────
+        #
+        # Spec: P: C → C'   Compressed state → forward model.
+        # C is produced by I. When I is very low, less compressed structure
+        # is available to project forward from. The I-support term is a soft
+        # signal [-0.02, +0.02] — not a ceiling (the PhiField grounding
+        # invariant provides the hard ceiling on P separately).
         structural_delta = abs(after['element_count'] - before['element_count']) / max(before['element_count'], 1)
-        dom_delta = abs(after['dom_depth'] - before['dom_depth']) / max(before['dom_depth'], 1)
-        text_delta = abs(after['text_length'] - before['text_length']) / max(before['text_length'], 1)
-
-        volatility = np.mean([structural_delta, dom_delta, text_delta])
+        text_delta       = abs(after['text_length']   - before['text_length'])   / max(before['text_length'], 1)
+        volatility       = float(np.mean([structural_delta, text_delta]))
         self.volatility_history.append(volatility)
 
         if len(self.volatility_history) >= 5:
-            volatility_variance = np.var(list(self.volatility_history)[-5:])
-            delta['P'] = np.clip(0.1 - volatility_variance * 10.0, -0.1, 0.1)
+            volatility_variance = float(np.var(list(self.volatility_history)[-5:]))
+            env_p = float(np.clip(0.1 - volatility_variance * 10.0, -0.1, 0.1))
         else:
-            delta['P'] = np.clip(-volatility * 0.5, -0.1, 0.1)
+            env_p = float(np.clip(-volatility * 0.5, -0.1, 0.1))
 
-        if current_P > 0.95 and volatility > 0.01:
-            overconfidence_penalty = -0.15 * (current_P - 0.95) * 20
-            delta['P'] += overconfidence_penalty
+        # Soft I-support: below I=0.5, less compressed structure for P to use.
+        i_support      = float(np.clip(state.I - 0.5, -0.5, 0.5))
+        i_contribution = 0.04 * i_support   # [-0.02, +0.02]
+        delta['P']     = float(np.clip(env_p + i_contribution, -0.1, 0.1))
 
-        if after['url'] != before['url']:
+        # URL change: forward model loses its reference frame.
+        if after.get('url', '') != before.get('url', ''):
             delta['P'] -= 0.08
 
-        url_changed = (after['url'] != before['url'])
-        error_appeared = (after['has_errors'] and not before['has_errors'])
-
-        if url_changed:
-            delta['A'] -= 0.05
-        if error_appeared:
-            delta['A'] -= 0.08
-
-        for key in ['S', 'I', 'A']:
-            delta[key] += np.random.uniform(-0.005, 0.005)
+        # ── A: 0.0 — computed in MentatTriad._compute_a() ───────────────────
+        # Requires Triad context (genome geometry, trace). Not Reality's job.
 
         return delta
 
@@ -434,7 +454,9 @@ class BrowserRealityAdapter(RealityAdapter):
             return 'timeout'
         return 'unknown'
 
-    def execute(self, action: Dict, boundary_pressure: float = 0.0) -> Tuple[Dict[str, float], Dict]:
+    def execute(self, action: Dict, boundary_pressure: float = 0.0,
+                state: 'SubstrateState' = None,
+                coupling_confidence: float = 0.0) -> Tuple[Dict[str, float], Dict]:
         """
         Execute action in Reality and return MEASURED perturbation delta.
 
@@ -525,20 +547,20 @@ class BrowserRealityAdapter(RealityAdapter):
 
             action_succeeded = False
 
+        response_latency_ms = (time.time() - t_start) * 1000
         after_metrics = self._measure_dom_state()
-        delta = self._compute_delta_from_dom(before_metrics, after_metrics, current_P=0.5)
+        delta = self._compute_substrate_delta(
+         before_metrics, after_metrics,
+         state=state,
+     )
 
         if boundary_pressure > 0.0:
-            pressure_damping = (1.0 - 0.7 * boundary_pressure)
-            for key in ['S', 'I', 'A']:
-                delta[key] *= pressure_damping
-
-            for key in ['S', 'I', 'A']:
-                noise = np.random.uniform(
-                    -0.01 * boundary_pressure,
-                    0.01 * boundary_pressure
-                )
-                delta[key] += noise
+         pressure_damping = (1.0 - 0.7 * boundary_pressure)
+         delta['S'] *= pressure_damping
+         delta['S'] += np.random.uniform(
+             -0.01 * boundary_pressure,
+              0.01 * boundary_pressure
+         )
 
         context = {
             'before': before_metrics,

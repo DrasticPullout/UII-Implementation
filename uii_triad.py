@@ -189,6 +189,14 @@ class MentatTriad:
             genome = TriadGenome()
         self.genome = genome
 
+        # v14.1 session_genome: live working copy of the parent genome.
+        # AutonomousTrajectoryLab reads from this, not from the frozen self.genome.
+        # CouplingMatrixEstimator pushes provisional Layer 2 updates here during the
+        # session (observation_count >= 20, confidence-weighted at 0.5x distilled).
+        # distill_to_genome at session end reads self.genome (unchanged) — heritable
+        # extraction is unaffected. Only the trajectory lab's causal model is live.
+        self.session_genome = copy.deepcopy(genome)
+
         self.log_mode = log_mode
 
         self.fitness_metrics = {
@@ -229,7 +237,7 @@ class MentatTriad:
         self.crk = CRKMonitor()
 
         self.trajectory_lab = AutonomousTrajectoryLab(reality, self.crk, self.phi_field,
-                                                      genome=genome)
+                                                      genome=self.session_genome)  # v14.1: live session copy, not frozen genome
 
         # v14.1: Model fidelity monitor
         self.model_fidelity_monitor = ModelFidelityMonitor()
@@ -469,6 +477,39 @@ class MentatTriad:
 
         drift = float(np.clip(drift, 0.0, 1.0))
         return 1.0 - drift
+    
+    def _compute_delta_i(self) -> float:
+        """
+        I: {S_i} → C   Compression quality of recent S history.
+
+        DASS spec: I measures how much pattern/regularity exists in what the
+        system has been sensing. Low variance in recent S observations means the
+        environment is patterned and compressible → I rises. High variance means
+        the environment is chaotic and incompressible → I falls.
+
+        This is purely external: it observes the regularity of what Reality has
+        delivered through the S layer. The trace is the Triad's record of those
+        perturbations. No SMO. No prediction error. No internal signals.
+
+        Lives in the Triad (not Reality) because compression quality requires
+        history — Reality executes one action at a time and returns a delta.
+        The Triad owns the trace.
+
+        Crossover at S-variance ≈ 0.005:
+            Below → patterned environment → compression improving → +delta_I
+            Above → chaotic environment  → compression degrading → -delta_I
+
+        Returns float in [-0.05, 0.05].
+        Fewer than 3 trace entries → 0.0 (neutral, not punitive).
+        """
+        recent = self.trace.get_recent(10)
+        if len(recent) < 3:
+            return 0.0
+
+        s_values   = [d['S'] for d in recent]
+        s_variance = float(np.var(s_values))
+
+        return float(np.clip(0.01 - 2.0 * s_variance, -0.05, 0.05))
 
     def step(self, verbose: bool = False) -> StepLog:
         """
@@ -528,6 +569,12 @@ class MentatTriad:
                 coupling_confidence=self.coupling_estimator.get_confidence(),
             )
 
+            # I: {S_i} → C  Compression quality of S history.
+            # Computed here: Triad owns the trace; Reality does not.
+            # Merged before apply_delta so SMO, CRK, and PhiField all
+            # see a coherent four-dimensional perturbation.
+            observed_delta['I'] = self._compute_delta_i()
+
             self.state.apply_delta(observed_delta, predicted_delta)
             self.trace.record(self.state)
 
@@ -541,11 +588,12 @@ class MentatTriad:
                     success=context.get('action_succeeded', True),
                     refusal=context.get('refusal', False)
                 )
-                self.cam.record_action_sequence(
-                    action=action,
-                    observed_delta=observed_delta,
-                    prev_action=prev_action
-                )
+                
+            self.cam.record_action_sequence(
+                action=action,
+                observed_delta=observed_delta,
+                prev_action=prev_action
+            )
 
             self.total_micro_perturbations += 1
 
@@ -573,6 +621,33 @@ class MentatTriad:
             print(f"  Actions: {dict((a, action_types.count(a)) for a in set(action_types))}")
 
         temporal_exclusions = self.reality_engine.temporal_memory.get_exclusion_count()
+
+        # v14.1: Provisional Layer 2 push into session_genome.
+        # Fires once per step when coupling_estimator has >= 20 observations
+        # (vs 50 required for distill_to_genome). Confidence is halved — these are
+        # intra-session estimates, not distilled heritable values. The trajectory lab
+        # reads session_genome so virtual mode sees an evolving causal model, not the
+        # frozen parent snapshot inherited at session start.
+        #
+        # distill_to_genome at session end reads self.genome (parent), not session_genome —
+        # heritable extraction is completely unaffected by this provisional layer.
+        if self.coupling_estimator.observation_count >= 20:
+            live_matrix = self.coupling_estimator.matrix.tolist()
+            live_confidence = self.coupling_estimator.get_confidence()
+            provisional_confidence = live_confidence * 0.5  # lower weight than distilled
+
+            self.session_genome.causal_model['coupling_matrix'] = {
+                'matrix': live_matrix,
+                'confidence': provisional_confidence,
+                'observations': self.coupling_estimator.observation_count,
+            }
+
+            # Action map: cam.get_empirical_action_map() already gates on >= 10 obs/affordance.
+            # Push whatever is ready — the trajectory lab will use it for unknown-affordance
+            # zero-delta fallback detection (Issue 2 bypass flag, future work).
+            live_action_map = self.cam.get_empirical_action_map()
+            if live_action_map:
+                self.session_genome.causal_model['action_substrate_map'] = live_action_map
 
         # v14: Run residual explainer (observe-only — genome write happens in run() finally)
         residual_explanation = None
@@ -776,6 +851,14 @@ class MentatTriad:
             tokens_used_this_step = manifold.enumeration_context.get('tokens_used', 0)
             self.death_clock.tick_tokens(tokens_used_this_step)
 
+            # v14.2 fix: if Groq daily rate limit is hit, tokens_used = 0 each call, so
+            # death_clock.current_tokens never reaches budget — system spins forever invoking
+            # a dead LLM. Check the rate_limited flag directly and force termination.
+            if hasattr(self.intelligence, 'llm') and getattr(self.intelligence.llm, 'rate_limited', False):
+                self.death_clock_termination = True
+                if verbose:
+                    print(f"\n[RATE LIMIT TERMINATION] Groq daily limit hit — forcing clean exit")
+
             trajectories_enumerated = manifold.size()
 
             if trajectories_enumerated == 0:
@@ -867,6 +950,7 @@ class MentatTriad:
                 committed_trajectory_desc = best_trajectory.rationale
                 committed_trajectory_steps = len(best_trajectory.steps)
                 committed_phi = best_trajectory.test_phi_final
+                self.trajectories_committed += 1  # v14.2 fix: counter was never incremented
 
         if committed_trajectory_desc and 'python' in committed_trajectory_desc.lower():
             self.fitness_metrics['migration_attempted'] = True

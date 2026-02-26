@@ -432,9 +432,6 @@ class ContinuousRealityEngine:
         viewport_height = affordances.get('viewport_height', 0)
         scrollable      = total_height - viewport_height
 
-        if state.P > 0.7:
-            return {'type': 'observe', 'params': {}}
-
         # v14.2: A-restoration scroll reflex removed.
         # The Φ strain term β(A-A₀)² already creates gradient pressure when A deviates.
         # The CNS following ∇Φ will naturally avoid actions that worsen A.
@@ -528,26 +525,35 @@ class ContinuousRealityEngine:
         if action_type in self.learned_predictions:
             return dict(self.learned_predictions[action_type])
 
-        # Fallback: hardcoded table (v14.2: A column zeroed throughout, query_agent + python added)
-        # Actions do not predict A delta — A is computed from Triad dynamics in the step loop.
-        # Non-zero A predictions here produced permanent structural prediction error,
-        # contaminating I quality (which now uses prediction error as its primary signal).
-        # query_agent and python were previously absent — fell through to all-zeros default,
-        # generating prediction error on every invocation.
+        # v14.2 fix: I is now predicted dynamically from current SMO prediction error,
+        # mirroring the formula in BrowserRealityAdapter._compute_substrate_delta.
+        # Previously this table had hardcoded I values (e.g. click: 0.01) which were
+        # always wrong — the actual I delta is computed from error, not from action type.
+        # The mismatch meant SMO prediction_error for I was permanently high (|actual - 0.01|),
+        # which drove rigidity toward 0 every step, triggering rigidity_crisis on every batch.
+        # Fix: estimate I using current prediction error so the prediction tracks reality.
+        recent_error = state.smo.get_recent_prediction_error(window=5)
+        # Mirrors _compute_substrate_delta: internal_i = clip(0.05 - 1.5 * error, -0.05, 0.05)
+        # plus a conservative coupling contribution of 0.0 (unknown at prediction time).
+        predicted_i = float(np.clip(0.05 - 1.5 * recent_error, -0.05, 0.05))
+
+        # Fallback: hardcoded S and P per action type. I column removed — now dynamic above.
+        # A column stays 0.0 throughout (A is computed from Triad dynamics, not predicted here).
         predictions = {
-            'navigate':    {'S': 0.05, 'I': 0.03, 'P': -0.08, 'A': 0.0},
-            'click':       {'S': 0.02, 'I': 0.01, 'P': -0.02, 'A': 0.0},
-            'fill':        {'S': 0.01, 'I': 0.02, 'P': -0.01, 'A': 0.0},
-            'type':        {'S': 0.01, 'I': 0.02, 'P': -0.01, 'A': 0.0},
-            'scroll':      {'S': 0.01, 'I': 0.0,  'P': -0.01, 'A': 0.0},
-            'read':        {'S': 0.03, 'I': 0.02, 'P':  0.0,  'A': 0.0},
-            'observe':     {'S': 0.0,  'I': 0.0,  'P':  0.0,  'A': 0.0},
-            'delay':       {'S': 0.0,  'I': 0.0,  'P':  0.0,  'A': 0.0},
-            'evaluate':    {'S': 0.0,  'I': 0.01, 'P': -0.01, 'A': 0.0},
-            'query_agent': {'S': 0.01, 'I': 0.0,  'P':  0.0,  'A': 0.0},
-            'python':      {'S': 0.0,  'I': 0.02, 'P':  0.0,  'A': 0.0},
+            'navigate':    {'S': 0.05, 'P': -0.08},
+            'click':       {'S': 0.02, 'P': -0.02},
+            'fill':        {'S': 0.01, 'P': -0.01},
+            'type':        {'S': 0.01, 'P': -0.01},
+            'scroll':      {'S': 0.01, 'P': -0.01},
+            'read':        {'S': 0.03, 'P':  0.0},
+            'observe':     {'S': 0.0,  'P':  0.0},
+            'delay':       {'S': 0.0,  'P':  0.0},
+            'evaluate':    {'S': 0.0,  'P': -0.01},
+            'query_agent': {'S': 0.01, 'P':  0.0},
+            'python':      {'S': 0.0,  'P':  0.0},
         }
-        return predictions.get(action_type, {'S': 0.0, 'I': 0.0, 'P': 0.0, 'A': 0.0})
+        sp = predictions.get(action_type, {'S': 0.0, 'P': 0.0})
+        return {'S': sp['S'], 'I': predicted_i, 'P': sp['P'], 'A': 0.0}
 
 
 # ============================================================
