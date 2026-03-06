@@ -29,7 +29,7 @@ class TriadGenome:
     """
     Four-layer heritable genome.
 
-    Layer 1: Fixed bootstrap (6 floats + 6 velocity fields — v14.1 adds velocity)
+    Layer 1: Operator geometry + velocity fields (v15.3: replaces scalar DASS proxies)
     Layer 2: Learned causal model (grows each generation via FAO.distill_to_genome)
     Layer 3: Discovered structure (emergent axes, strict 4-condition admission)
     Layer 4: Lineage history (last 5 generations — enables velocity computation)
@@ -38,23 +38,38 @@ class TriadGenome:
     They are populated by FAO.distill_to_genome and extract_genome_v14_1.py at session end.
     Only predictively valid structure survives compression pressure.
 
-    Backward compatible: v14 genome.json loads fine (velocity fields default 0.0,
-    lineage_history defaults to []).
+    v15.3 Layer 1 change: S_bias/I_bias/P_bias/A_bias removed — they were scalar proxies
+    of DASS operators, not operator geometry. Replaced with:
+      - scalar velocity targets derived from operator geometry at peak Vol_opt
+      - operator geometry dicts that seed operators on initialization
+    I_bias dropped entirely: compression geometry is already L2 (coupling_matrix).
     """
 
-    # Layer 1: Fixed bootstrap + velocity fields (v14.1 adds velocity)
-    S_bias: float = 0.5
-    S_velocity: float = 0.0
-    I_bias: float = 0.5
-    I_velocity: float = 0.0
-    P_bias: float = 0.5
-    P_velocity: float = 0.0
-    A_bias: float = 0.7
-    A_velocity: float = 0.0
-    rigidity_init: float = 0.5
+    # Layer 1a: Scalar velocity targets — derived from operator geometry at peak Vol_opt.
+    # These are what GeneticVelocityEstimator tracks slopes on across generations.
+    # All default to 0.0: generation 0 operators initialize from DEFAULT_CHANNELS only.
+    s_coverage_mean: float = 0.0           # mean coverage of active S channels
+    s_coverage_mean_velocity: float = 0.0
+    p_horizon_norm: float = 0.0            # realized_horizon / 50.0
+    p_horizon_norm_velocity: float = 0.0
+    a_loop_closure: float = 0.0            # loop_closure at peak Vol_opt
+    a_loop_closure_velocity: float = 0.0
+    rigidity_init: float = 0.5             # SMO plasticity seed (search param)
     rigidity_init_velocity: float = 0.0
-    phi_coherence_weight: float = 0.7
+    phi_coherence_weight: float = 0.7      # Φ geometry weight (search param)
     phi_coherence_velocity: float = 0.0
+
+    # Layer 1b: Operator geometry dicts — seed operators at session start.
+    # Empty dicts on generation 0: operators initialize from DEFAULT_CHANNELS.
+    # Populated from peak Vol_opt snapshot by distill_to_genome.
+    operator_s_channels: Dict = field(default_factory=dict)
+        # {channel_id: {coverage, signal_rate}} — inherited sensing surface
+    operator_p_accuracy: Dict = field(default_factory=dict)
+        # {channel_id: float} — inherited prediction accuracy per channel
+    operator_p_horizon: int = 0
+        # inherited realized_horizon (int; normalization only for velocity target)
+    operator_a_signature: Dict = field(default_factory=dict)
+        # {active_channels, graph_edges, predictions, mean_confidence} — coherence basin
 
     # Evolution metadata
     generation: int = 0
@@ -69,10 +84,17 @@ class TriadGenome:
     # Layer 4: Lineage history (last N=5 generations — enables velocity computation)
     lineage_history: List[Dict] = field(default_factory=list)
 
+    # Cross-generation peak: highest Vol_opt coupling state seen across all generations.
+    # Populated by PeakOptionalityTracker.update() in distill_to_genome.
+    # Empty dict on generation 0.
+    peak_optionality: Dict = field(default_factory=dict)
+
     def mutate(self, mutation_rate: float = 0.1) -> 'TriadGenome':
         """
-        Gaussian mutation on Layer 1 bias fields only.
-        Velocity fields are NOT mutated — they are computed by GeneticVelocityEstimator.
+        Gaussian mutation on Layer 1 scalar targets only.
+        Velocity fields and operator geometry dicts are NOT mutated:
+          - velocities are computed by GeneticVelocityEstimator from lineage
+          - operator geometry passes through intact to seed operators
         Layers 2, 3, 4 pass through intact — FAO.distill_to_genome handles them.
         """
         mutated = copy.deepcopy(self)
@@ -81,7 +103,7 @@ class TriadGenome:
             current = getattr(self, field_name)
             noise = np.random.normal(0, mutation_rate)
             setattr(mutated, field_name, np.clip(current + noise, 0, 1))
-        # Velocity fields pass through unmodified
+        # Velocity fields and operator geometry dicts pass through unmodified
         return mutated
 
     def richness_summary(self) -> Dict:
@@ -94,7 +116,28 @@ class TriadGenome:
         admitted_count = sum(1 for v in discovered.values() if v.get('status', 'admitted') == 'admitted')
         return {
             'generation': self.generation,
-            'layer1': '6 floats + 6 velocity fields',
+            'layer1': f'{len(LAYER1_PARAMS)} geometry scalars + {len(LAYER1_PARAMS)} velocity fields',
+            'layer1_s_channels': len(self.operator_s_channels),
+            'layer1_p_accuracy_channels': len(self.operator_p_accuracy),
+            'layer1_a_signature_keys': len(self.operator_a_signature),
+            'layer2_keys': list(causal.keys()),
+            'coupling_confidence': causal.get('coupling_matrix', {}).get('confidence', 0.0),
+            'coupling_observations': causal.get('coupling_matrix', {}).get('observations', 0),
+            'action_map_affordances': len(causal.get('action_substrate_map', {})),
+            'layer3_axes': len(discovered),
+            'layer3_keys': list(discovered.keys()),
+            'layer3_provisional': provisional_count,
+            'layer3_admitted': admitted_count,
+            'lineage_depth': len(self.lineage_history),
+            'velocity_magnitude': velocity_magnitude,
+            'coherence_score': causal.get('model_fidelity', None),
+        }
+        return {
+            'generation': self.generation,
+            'layer1': f'{len(LAYER1_PARAMS)} geometry scalars + {len(LAYER1_PARAMS)} velocity fields',
+            'layer1_s_channels': len(self.operator_s_channels),
+            'layer1_p_accuracy_channels': len(self.operator_p_accuracy),
+            'layer1_a_signature_keys': len(self.operator_a_signature),
             'layer2_keys': list(causal.keys()),
             'coupling_confidence': causal.get('coupling_matrix', {}).get('confidence', 0.0),
             'coupling_observations': causal.get('coupling_matrix', {}).get('observations', 0),
@@ -335,6 +378,95 @@ class ProvisionalAxisManager:
 
 
 # ============================================================
+# PEAK OPTIONALITY — CROSS-GENERATION STATE
+# ============================================================
+
+class PeakOptionalityTracker:
+    """
+    Manages the genome's all-time peak optionality state across generations.
+
+    Vol_opt = Σ_{λ_i > 0} λ_i  (sum of positive eigenvalues of coupling matrix).
+    This is the geometric volume of the reachable future state space — the quantity
+    that determines whether migration is needed and what attractor basin was richest.
+
+    Lives in the genome (not the triad) because the highest-Vol_opt coupling state
+    seen across ALL generations is what should propagate forward. A degraded run
+    (bad environment, budget exhaustion) must not overwrite a richer prior coupling.
+
+    The coupling matrix earned at peak optionality IS the best L2 state we have — it
+    encodes the causal geometry of the richest attractor the system has ever inhabited.
+
+    Serialized as a plain dict inside TriadGenome.peak_optionality so it survives
+    JSON round-trips through extract_genome and load_genome unchanged.
+
+    Cross-gen update rule: session peak replaces genome peak only if session Vol_opt
+    strictly exceeds stored Vol_opt. Ties keep the older (more verified) state.
+    """
+
+    MIN_OBSERVATIONS: int = 20  # matches SRE coupling-first threshold
+
+    @staticmethod
+    def vol_opt(matrix: np.ndarray) -> float:
+        """Sum of positive eigenvalues of coupling matrix."""
+        eigenvalues = np.linalg.eigvalsh(matrix)
+        return float(np.sum(eigenvalues[eigenvalues > 0]))
+
+    @staticmethod
+    def update(genome_peak: Dict,
+               session_peak: Optional[Dict],
+               current_generation: int) -> Dict:
+        """
+        Compare session peak against genome's stored all-time peak.
+
+        session_peak: dict from MentatTriad session tracking —
+            keys: peak_vol_opt, peak_step, l2_coupling_matrix.
+            None if session never reached MIN_OBSERVATIONS.
+
+        Returns the new genome.peak_optionality value.
+        Unchanged if session didn't improve on the stored peak.
+        """
+        if not session_peak:
+            return genome_peak
+
+        session_vol = session_peak.get('peak_vol_opt', -1.0)
+        stored_vol  = genome_peak.get('vol_opt', -1.0)
+
+        if session_vol > stored_vol:
+            return {
+                'vol_opt':        session_vol,
+                'peak_step':      session_peak.get('peak_step', -1),
+                'generation':     current_generation,
+                'coupling_entry': session_peak.get('l2_coupling_matrix'),
+            }
+
+        return genome_peak  # existing genome peak was richer — preserve it
+
+    @staticmethod
+    def best_coupling_entry(genome_peak: Dict,
+                            terminal_entry: Dict,
+                            min_obs: int = 50) -> Dict:
+        """
+        Return the coupling entry to use for L2 merge: genome peak or terminal.
+
+        genome_peak wins when:
+          - coupling_entry present with sufficient observations, AND
+          - its Vol_opt >= terminal Vol_opt.
+
+        Terminal wins if genome peak is absent, under-observed, or weaker.
+        Called by distill_to_genome after update() has resolved the new peak.
+        """
+        peak_entry = genome_peak.get('coupling_entry')
+        if not peak_entry or peak_entry.get('observations', 0) < min_obs:
+            return terminal_entry
+
+        peak_vol = genome_peak.get('vol_opt', -1.0)
+        terminal_matrix = np.array(terminal_entry.get('matrix', np.eye(4).tolist()))
+        terminal_vol = PeakOptionalityTracker.vol_opt(terminal_matrix)
+
+        return peak_entry if peak_vol >= terminal_vol else terminal_entry
+
+
+# ============================================================
 # GENOME UTILITIES
 # ============================================================
 
@@ -351,21 +483,34 @@ def load_genome(path: str) -> TriadGenome:
 
     genome_dict = data['genome']
 
-    # Layer 1 params + velocity fields (velocity defaults to 0.0 for v14 genomes)
-    active_params = {k: v for k, v in genome_dict.items()
-                    if k in ['S_bias', 'S_velocity',
-                             'I_bias', 'I_velocity',
-                             'P_bias', 'P_velocity',
-                             'A_bias', 'A_velocity',
-                             'rigidity_init', 'rigidity_init_velocity',
-                             'phi_coherence_weight', 'phi_coherence_velocity',
-                             'generation', 'parent_fitness']}
+    # Layer 1: scalar velocity targets + velocity fields.
+    # Backward compat: old scalar DASS fields (S_bias etc.) are ignored if present —
+    # they're not in LAYER1_PARAMS and won't be passed to TriadGenome constructor.
+    _L1_SCALAR_FIELDS = (
+        ['s_coverage_mean', 's_coverage_mean_velocity',
+         'p_horizon_norm', 'p_horizon_norm_velocity',
+         'a_loop_closure', 'a_loop_closure_velocity',
+         'rigidity_init', 'rigidity_init_velocity',
+         'phi_coherence_weight', 'phi_coherence_velocity',
+         'generation', 'parent_fitness']
+    )
+    active_params = {k: v for k, v in genome_dict.items() if k in _L1_SCALAR_FIELDS}
+
+    # Layer 1b: operator geometry dicts (default to empty on generation 0)
+    active_params['operator_s_channels'] = genome_dict.get('operator_s_channels', {})
+    active_params['operator_p_accuracy']  = genome_dict.get('operator_p_accuracy', {})
+    active_params['operator_p_horizon']   = int(genome_dict.get('operator_p_horizon', 0))
+    active_params['operator_a_signature'] = genome_dict.get('operator_a_signature', {})
 
     # Layers 2 and 3 (unchanged)
     active_params['causal_model'] = genome_dict.get('causal_model', {})
     active_params['discovered_structure'] = genome_dict.get('discovered_structure', {})
-    # Layer 4 (present in v14.1, empty list for v14 genomes)
+    # Layer 4 (present in v14.1+, empty list for older genomes)
     active_params['lineage_history'] = genome_dict.get('lineage_history', [])
+    # Cross-generation peak (present in v15.3+, empty dict for older genomes)
+    active_params['peak_optionality'] = genome_dict.get('peak_optionality', {})
+    # Cross-generation peak (present in v15.3+, empty dict for older genomes)
+    active_params['peak_optionality'] = genome_dict.get('peak_optionality', {})
 
     genome = TriadGenome(**active_params)
 
@@ -386,6 +531,9 @@ def load_genome(path: str) -> TriadGenome:
     print(f"\n[LOADED GENOME]")
     print(f"  Generation: {genome.generation}")
     print(f"  Parent fitness: {genome.parent_fitness:.2f}")
+    print(f"  S coverage mean: {genome.s_coverage_mean:.3f} | S channels: {richness['layer1_s_channels']}")
+    print(f"  P horizon norm:  {genome.p_horizon_norm:.3f} | P accuracy channels: {richness['layer1_p_accuracy_channels']}")
+    print(f"  A loop closure:  {genome.a_loop_closure:.3f} | A signature keys: {richness['layer1_a_signature_keys']}")
     print(f"  Coupling confidence: {richness['coupling_confidence']:.2f}")
     print(f"  Action map: {richness['action_map_affordances']} affordances")
     print(f"  Discovered axes: {richness['layer3_axes']}")

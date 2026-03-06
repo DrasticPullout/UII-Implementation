@@ -29,7 +29,7 @@ from uii_types import (
     INTERFACE_COUPLED_SIGNALS, POTENTIALLY_INVARIANT_SIGNALS,
     SubstrateState, TrajectoryCandidate,
 )
-from uii_genome import TriadGenome, ProvisionalAxisManager
+from uii_genome import TriadGenome, ProvisionalAxisManager, PeakOptionalityTracker
 from uii_reality import CouplingMatrixEstimator
 
 class ResidualTracker:
@@ -506,12 +506,11 @@ class FailureAssimilationOperator:
 
         self.mutation_bias = {
             'genome_sigma': {
-                'S_bias': 0.1,
-                'I_bias': 0.1,
-                'P_bias': 0.1,
-                'A_bias': 0.1,
-                'rigidity_init': 0.1,
-                'phi_coherence_weight': 0.1
+                's_coverage_mean':      0.1,
+                'p_horizon_norm':       0.1,
+                'a_loop_closure':       0.1,
+                'rigidity_init':        0.1,
+                'phi_coherence_weight': 0.1,
             },
             'coupling_weights': {
                 'smo_rigidity': 1.0,
@@ -537,48 +536,20 @@ class FailureAssimilationOperator:
         self.bias_update_count = 0
 
     def assimilate_relation_failure(self, failure_record: Dict):
-        """Extract geometric pressures from semantic failure."""
-        self.failure_history.append(failure_record)
-        self.total_failures_assimilated += 1
+        """
+        DEPRECATED v15.0.
 
-        failure_type = failure_record.get('type', '')
-        severity = failure_record.get('severity', 1.0)
+        In v14.x this performed semantic→geometric translation of LLM failures
+        into mutation bias. In v15.0 the LLM is an affordance — its outcomes feed
+        CouplingMatrixEstimator directly like any other affordance. No translation
+        needed.
 
-        if failure_type == 'state_instability':
-            self.mutation_bias['coupling_weights']['phi_beta'] *= (1.0 + 0.1 * severity)
-            self.mutation_bias['perturbation_emphasis']['I'] *= (1.0 + 0.2 * severity)
-            self.mutation_bias['genome_sigma']['I_bias'] *= (1.0 + 0.15 * severity)
-            self.bias_update_count += 1
-
-        elif failure_type == 'optionality_collapse':
-            self.mutation_bias['genome_sigma']['P_bias'] *= (1.0 + 0.15 * severity)
-            self.mutation_bias['perturbation_emphasis']['P'] *= (1.0 + 0.3 * severity)
-            self.bias_update_count += 1
-
-        elif failure_type == 'coherence_drift':
-            self.mutation_bias['genome_sigma']['A_bias'] *= (1.0 + 0.1 * severity)
-            self.mutation_bias['coupling_weights']['phi_A0'] *= (1.0 + 0.2 * severity)
-            self.mutation_bias['perturbation_emphasis']['A'] *= (1.0 + 0.15 * severity)
-            self.bias_update_count += 1
-
-        elif failure_type == 'closure_violation':
-            for coupling in self.mutation_bias['coupling_weights']:
-                current = self.mutation_bias['coupling_weights'][coupling]
-                self.mutation_bias['coupling_weights'][coupling] = \
-                    current * 0.9 + 1.0 * 0.1
-            self.bias_update_count += 1
-
-        elif failure_type == 'serialization_failed':
-            self.mutation_bias['genome_sigma']['rigidity_init'] *= (1.0 + 0.2 * severity)
-            self.bias_update_count += 1
-
-        elif failure_type == 'boundary_exhaustion':
-            for param in self.mutation_bias['genome_sigma']:
-                self.mutation_bias['genome_sigma'][param] *= (1.0 + 0.05 * severity)
-            self.bias_update_count += 1
-
-        self._apply_decay()
-        self._enforce_bounds()
+        Retained as a no-op for backward compatibility with v14 log readers and
+        any callers that have not yet been updated. The call in uii_triad.py is
+        still present but fires only when llm_invoked=True (Tier 3), and its
+        effect is now zero.
+        """
+        pass  # no-op
 
     def _apply_decay(self):
         for param in self.mutation_bias['genome_sigma']:
@@ -622,12 +593,12 @@ class FailureAssimilationOperator:
             )
 
     def get_informed_genome(self, parent_genome: 'TriadGenome') -> 'TriadGenome':
-        """Mutate genome with learned bias. Layers 2/3 pass through intact."""
+        """Mutate genome with learned bias. Layers 2/3 pass through intact.
+        Operator geometry dicts (L1b) pass through — set by distill_to_genome."""
         child = copy.deepcopy(parent_genome)
         child.generation += 1
 
-        for field_name in ['S_bias', 'I_bias', 'P_bias', 'A_bias',
-                      'rigidity_init', 'phi_coherence_weight']:
+        for field_name in LAYER1_PARAMS:
             current = getattr(parent_genome, field_name)
             sigma = self.mutation_bias['genome_sigma'][field_name]
             noise = np.random.normal(0, sigma)
@@ -722,14 +693,22 @@ class FailureAssimilationOperator:
                            axis_admission: AxisAdmissionTest,
                            phi_history: List[float],
                            parent_genome: TriadGenome,
-                           session_length: int = 100) -> TriadGenome:
+                           session_length: int = 100,
+                           migration_history: Optional[List] = None,
+                           peak_snapshot: Optional[Dict] = None) -> TriadGenome:
         """
         SESSION → GENOME BRIDGE. v14.1: uses ProvisionalAxisManager for Layer 3 decay.
+        v15 Step 4: migration_history extracted into Layer 2 migration_geometry at run end.
 
         Layer 1: Mutated via get_informed_genome (existing FAO mechanism, unchanged).
         Layer 2: Coupling matrix merged if >= 50 session observations.
                  Action map written for any affordance with >= 10 observations.
                  Merged with parent values, session weighted by evidence.
+                 migration_geometry (v15): compact summary of migrate attempt geometry,
+                   merged with parent genome's existing migration_geometry if present.
+                   Written here (run end) only — External Measurement Invariant preserved.
+                   Contents: outcome distribution, code_hash dedup set, coupling states
+                   of successful attempts (for SRE proximity filtering next run).
         Layer 3: ProvisionalAxisManager two-tier lifecycle:
                  - Admitted: 0.8x decay, floor 20 (unchanged from v14)
                  - Provisional: 0.5x decay (0.6x if session < 30 steps), floor 5
@@ -743,14 +722,59 @@ class FailureAssimilationOperator:
         # === LAYER 2: LEARNED CAUSAL MODEL ===
         causal = dict(parent_genome.causal_model)
 
-        # Coupling matrix: merge if sufficient session evidence
-        if coupling_estimator.observation_count >= 50:
+        # Coupling matrix: merge using the richest coupling state across all generations.
+        # PeakOptionalityTracker.update() first advances the genome's cross-gen peak by
+        # comparing this session's peak against what the genome already holds — keeping
+        # whichever has higher Vol_opt. best_coupling_entry() then selects between that
+        # peak and the terminal state for the actual merge.
+        # This ensures a degraded run (poor environment, budget exhaustion) cannot
+        # overwrite a richer coupling state earned in a prior generation.
+        child.peak_optionality = PeakOptionalityTracker.update(
+            parent_genome.peak_optionality,
+            peak_snapshot,
+            child.generation,
+        )
+
+        # === LAYER 1b: OPERATOR GEOMETRY — extracted from peak Vol_opt snapshot ===
+        # Peak snapshot contains the operator state at highest Vol_opt this session.
+        # Scalar velocity targets (s_coverage_mean, p_horizon_norm, a_loop_closure) are
+        # computed from the same snapshot so GeneticVelocityEstimator tracks geometry.
+        # Generation 0 or no peak: operator geometry dicts stay as inherited (or empty).
+        if peak_snapshot:
+            _s_ch = peak_snapshot.get('operator_s_channels', {})
+            _p_acc = peak_snapshot.get('operator_p_accuracy', {})
+            _p_hor = int(peak_snapshot.get('operator_p_horizon', 0))
+            _a_sig = peak_snapshot.get('operator_a_signature', {})
+
+            child.operator_s_channels = _s_ch
+            child.operator_p_accuracy = _p_acc
+            child.operator_p_horizon  = _p_hor
+            child.operator_a_signature = _a_sig
+
+            # Scalar velocity targets — derived from the same geometry
+            child.s_coverage_mean = float(np.mean(list(
+                v.get('coverage', 0.0) for v in _s_ch.values()
+            ))) if _s_ch else 0.0
+            child.p_horizon_norm = float(np.clip(_p_hor / 50.0, 0.0, 1.0))
+            child.a_loop_closure = float(np.clip(
+                _a_sig.get('mean_confidence', 0.0) if _a_sig else 0.0, 0.0, 1.0
+            ))
+
+        terminal_entry = coupling_estimator.to_genome_entry()
+        source_entry = PeakOptionalityTracker.best_coupling_entry(
+            child.peak_optionality,
+            terminal_entry,
+            min_obs=50,
+        )
+        effective_coupling = CouplingMatrixEstimator.from_genome_entry(source_entry)
+
+        if effective_coupling.observation_count >= 50:
             parent_coupling_entry = causal.get('coupling_matrix', {
                 'matrix': np.eye(4).tolist(),
                 'observations': 0,
                 'confidence': 0.0
             })
-            merged = CouplingMatrixEstimator.merge(parent_coupling_entry, coupling_estimator)
+            merged = CouplingMatrixEstimator.merge(parent_coupling_entry, effective_coupling)
             causal['coupling_matrix'] = merged.to_genome_entry()
 
         # Action substrate map: merge with parent, weighted by evidence
@@ -770,6 +794,74 @@ class FailureAssimilationOperator:
                 else:
                     merged_map[affordance] = new_delta
             causal['action_substrate_map'] = merged_map
+
+        # === LAYER 2: MIGRATION GEOMETRY (v15 Step 4) ===
+        # Extracted at run end only. Never mid-run. External Measurement Invariant preserved.
+        #
+        # Structure:
+        #   bad_hashes:           set of code_hashes that produced coherence_loss or
+        #                         serialized_only — SRE dedup filter next run
+        #   successful_coupling_states: list of 4x4 coupling matrix snapshots (as lists)
+        #                         at spawn_attempted/handshake_received attempts — SRE
+        #                         proximity filter next run (prefer geometrically near states)
+        #   outcome_counts:       {outcome: count} across this session
+        #   total_attempts:       int — helps SRE weight this geometry by evidence
+        #
+        # Merge rule: union bad_hashes, append successful coupling states (dedup by
+        # Frobenius distance > 0.1 to avoid redundant near-copies), sum outcome_counts.
+        if migration_history:
+            parent_geo = causal.get('migration_geometry', {
+                'bad_hashes': [],
+                'successful_coupling_states': [],
+                'outcome_counts': {},
+                'total_attempts': 0,
+            })
+
+            session_bad_hashes = set()
+            session_good_states = []
+            session_outcome_counts: Dict[str, int] = {}
+
+            for attempt in migration_history:
+                # attempt may be a MigrationAttempt dataclass or a plain dict
+                outcome    = attempt.get('outcome') if isinstance(attempt, dict) else attempt.outcome
+                code_hash  = attempt.get('code_hash') if isinstance(attempt, dict) else attempt.code_hash
+                cs         = attempt.get('coupling_state') if isinstance(attempt, dict) else attempt.coupling_state
+
+                session_outcome_counts[outcome] = session_outcome_counts.get(outcome, 0) + 1
+
+                if outcome in ('coherence_loss', 'serialized_only'):
+                    if code_hash:
+                        session_bad_hashes.add(code_hash)
+                elif outcome in ('spawn_attempted', 'handshake_received'):
+                    if cs is not None:
+                        session_good_states.append(cs)
+
+            # Merge bad_hashes: simple union
+            merged_bad = set(parent_geo.get('bad_hashes', [])) | session_bad_hashes
+
+            # Merge successful coupling states: keep parent states, add session states
+            # that are not near-duplicates (Frobenius distance > 0.1 from all existing)
+            merged_good = list(parent_geo.get('successful_coupling_states', []))
+            for new_cs in session_good_states:
+                new_arr = np.array(new_cs)
+                is_dup = any(
+                    np.linalg.norm(new_arr - np.array(existing), 'fro') < 0.1
+                    for existing in merged_good
+                )
+                if not is_dup:
+                    merged_good.append(new_cs)
+
+            # Merge outcome counts
+            merged_outcomes = dict(parent_geo.get('outcome_counts', {}))
+            for k, v in session_outcome_counts.items():
+                merged_outcomes[k] = merged_outcomes.get(k, 0) + v
+
+            causal['migration_geometry'] = {
+                'bad_hashes':                list(merged_bad),
+                'successful_coupling_states': merged_good,
+                'outcome_counts':            merged_outcomes,
+                'total_attempts':            parent_geo.get('total_attempts', 0) + len(migration_history),
+            }
 
         # === LAYER 3: DISCOVERED STRUCTURE (v14.1: two-tier via ProvisionalAxisManager) ===
         discovered = dict(parent_genome.discovered_structure)

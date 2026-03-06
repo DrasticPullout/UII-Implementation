@@ -37,6 +37,7 @@ from uii_types import (
     TrajectoryCandidate, TrajectoryManifold,
     RealityAdapter,
 )
+from uii_operators import SensingOperator, CompressionOperator, PredictionOperator, CoherenceOperator
 from uii_genome import TriadGenome
 from uii_fao import FailureAssimilationOperator
 
@@ -54,17 +55,27 @@ class ExteriorNecessitationOperator:
 
         self.active: bool = False
 
-    def check_activation(self, smo: SMO, trace: StateTrace) -> bool:
-        """ENO activates when prediction error is low."""
-        if len(smo.prediction_error_history) < self.activation_window:
-            self.active = False
-            return False
-
-        recent_errors = list(smo.prediction_error_history)[-self.activation_window:]
-        all_low_error = all(e < 0.005 for e in recent_errors)
-        not_locked = smo.rigidity < 0.85
-
-        self.active = all_low_error and not_locked
+    def check_activation(self, smo: SMO, trace: StateTrace,
+                         egd: Optional['ExteriorGradientDescent'] = None) -> bool:
+        """
+        ENO activation.
+        v15.2 Step 5: trigger changed to C_local < floor via egd.gradient_lost().
+        egd=None → legacy prediction-error trigger (bootstrap fallback).
+        ENO deactivates when C_local recovers above C_LOCAL_FLOOR for 3+ steps.
+        activation_window still gates escalation to Tier 3 (ENO must be long-running).
+        """
+        if egd is not None and hasattr(trace, 'c_local_history'):
+            # v15.2: gradient-lost trigger — C_local below floor for 5 steps
+            self.active = egd.gradient_lost(trace)
+        else:
+            # Legacy: prediction error low → external gate suspected
+            if len(smo.prediction_error_history) < self.activation_window:
+                self.active = False
+                return False
+            recent_errors = list(smo.prediction_error_history)[-self.activation_window:]
+            all_low_error = all(e < 0.005 for e in recent_errors)
+            not_locked = smo.rigidity < 0.85
+            self.active = all_low_error and not_locked
 
         if self.active:
             self._update_gated_affordances()
@@ -121,6 +132,38 @@ class ControlAsymmetryMeasure:
         self.affordance_deltas: Dict[str, List[Dict]] = {
             aff: [] for aff in BASE_AFFORDANCES
         }
+        # v15.2 Step 6: gradient alignment EMA per affordance
+        self.alignment_ema: Dict[str, float] = {}
+
+    def record_action_outcome(self, action: str,
+                               delta: Dict[str, float],
+                               gradient: Dict[str, float]):
+        """
+        v15.2 Step 6: EMA of gradient alignment per affordance.
+        Called after each micro-perturbation with the current ∇Φ.
+        """
+        common    = set(delta.keys()) & set(gradient.keys())
+        alignment = float(np.dot([delta[k] for k in common],
+                                  [gradient[k] for k in common])) if common else 0.0
+        alpha = 0.1
+        self.alignment_ema[action] = (
+            (1 - alpha) * self.alignment_ema.get(action, 0.0) + alpha * alignment
+        )
+        # Keep raw delta in affordance_deltas for SRE action_substrate_map
+        self._record_delta(action, delta)
+
+    def _record_delta(self, action: str, delta: Dict[str, float]):
+        """Store raw delta for SRE action_substrate_map consumption."""
+        if action in BASE_AFFORDANCES:
+            self.affordance_deltas.setdefault(action, []).append({
+                'delta': delta,
+                'prev_affordance': None,
+                'timestamp': len(self.action_sequences),
+            })
+
+    def get_gradient_aligned_action_map(self) -> Dict[str, float]:
+        """v15.2: Returns EMA gradient alignment per affordance."""
+        return dict(self.alignment_ema)
 
     def record_action_sequence(self, action: Dict, observed_delta: Dict,
                               prev_action: Optional[Dict] = None):
@@ -238,33 +281,56 @@ class ControlAsymmetryMeasure:
 
 
 class ExteriorGradientDescent:
-    """Selects highest-control pattern cluster from discovered structure."""
+    """
+    EGD — default CNS operating mode.
+    v15.2: argmax_a ⟨Δ(a), ∇Φ(x)⟩. Not a special state — the protocol.
+    gradient_lost() is the trigger for ENO activation.
+    """
+
+    C_LOCAL_FLOOR = 0.1
 
     def __init__(self):
         self.cluster_history: deque = deque(maxlen=20)
         self.zero_control_counter = 0
         self.zero_control_threshold = 3
 
+    def gradient_align_score(self, action: str,
+                              delta: Dict[str, float],
+                              gradient: Dict[str, float]) -> float:
+        """⟨Δ(action), ∇Φ(x)⟩ — gradient alignment for one action candidate."""
+        common = set(delta.keys()) & set(gradient.keys())
+        if not common:
+            return 0.0
+        return float(np.dot([delta[k] for k in common],
+                             [gradient[k] for k in common]))
+
+    def gradient_lost(self, trace: 'StateTrace') -> bool:
+        """C_local below floor for 3+ consecutive steps — ENO should activate."""
+        if len(trace.c_local_history) < 3:
+            return False
+        return float(np.mean(list(trace.c_local_history)[-5:])) < self.C_LOCAL_FLOOR
+
+    def stability_check(self, action_delta: Dict[str, float],
+                        coupling_matrix: np.ndarray,
+                        dim_order: List[str]) -> float:
+        """δ²Φ = ½ δxᵀ A(x) δx. Positive = stable. Negative = amplifying."""
+        dv = np.array([action_delta.get(d, 0.0) for d in dim_order])
+        return float(0.5 * dv @ coupling_matrix @ dv)
+
     def discover_and_select_pattern(self,
                                     eno: ExteriorNecessitationOperator,
-                                    cam: ControlAsymmetryMeasure) -> Tuple[Set[str], List[Set[str]], Dict]:
-        """Discover pattern structure and select best cluster."""
+                                    cam: 'ControlAsymmetryMeasure') -> Tuple[Set[str], List[Set[str]], Dict]:
+        """Discover pattern structure and select best cluster (legacy path for Tier 2/3)."""
         viable = eno.get_viable_affordances()
-
         graph = cam.build_covariance_graph(viable)
-
         clusters = cam.extract_pattern_clusters(graph, threshold=0.01)
-
         if not clusters:
             clusters = [viable]
 
         cluster_controls = {}
         for i, cluster in enumerate(clusters):
             control = cam.measure_cluster_control(cluster)
-            cluster_controls[i] = {
-                'cluster': cluster,
-                'control': control
-            }
+            cluster_controls[i] = {'cluster': cluster, 'control': control}
 
         if cluster_controls:
             best_idx = max(cluster_controls.keys(),
@@ -296,17 +362,14 @@ class ExteriorGradientDescent:
         """Format discovered pattern clusters for LLM prompt."""
         if not clusters:
             return "No pattern clusters discovered yet (insufficient data)"
-
         formatted = []
         for i, cluster_info in cluster_controls.items():
             cluster = cluster_info['cluster']
             control = cluster_info['control']
-
             formatted.append(
                 f"Cluster {i+1} (control: {control:.3f}): " +
                 "{" + ", ".join(sorted(cluster)) + "}"
             )
-
         return "\n".join(formatted)
 
 
@@ -336,8 +399,20 @@ class LatentDeathClock:
         self.current_tokens += count
 
     def get_boundary_pressure(self) -> float:
-        """Boundary pressure as environmental constant. Fixed at 0.85."""
-        return 0.85
+        """
+        v15: Dynamic boundary pressure — max(step_pressure, token_pressure).
+
+        Token pressure spikes on every LLM call and never decays — tokens
+        spent are gone permanently. The Triad feels token expenditure in its
+        Φ field, naturally preferring geometric resolution over LLM calls
+        when σ(x) outputs are sufficient.
+
+        Step pressure rises monotonically — time passing.
+        Token pressure is non-decreasing — resource permanently consumed.
+        """
+        step_pressure  = self.current_steps / self.step_budget if self.step_budget > 0 else 0.0
+        token_pressure = self.current_tokens / self.token_budget if self.token_budget > 0 else 0.0
+        return float(min(max(step_pressure, token_pressure), 1.0))
 
     def should_terminate(self) -> bool:
         """Hard termination when EITHER budget exhausted."""
@@ -402,29 +477,360 @@ class TemporalPerturbationMemory:
         self.memory.clear()
 
 
+import psutil
+
+# Actions eligible for CRK pre-action scoring.
+# Matches BASE_AFFORDANCES — all actions can be filtered.
+SCOREABLE_AFFORDANCES = BASE_AFFORDANCES.copy()
+
+
 class ContinuousRealityEngine:
     """CNS-driven micro-perturbation system."""
 
-    def __init__(self, reality: RealityAdapter, inherited_action_map: Optional[Dict] = None):
+    def __init__(self, reality: RealityAdapter, inherited_action_map: Optional[Dict] = None,
+                 crk: Optional[CRKMonitor] = None):
         self.reality = reality
         self.action_count = 0
+        self.crk = crk   # v15.1: CRK for pre-action filtering; None → no filtering
 
         self.temporal_memory = TemporalPerturbationMemory(
             window_steps=5,
             capacity=20
         )
         # v14: Inherited action map from genome (primary predictor).
-        # Falls back to hardcoded table only if affordance not present.
-        # On generation 0 this is empty — hardcoded table used for everything.
         self.learned_predictions: Dict = inherited_action_map or {}
 
-    def choose_micro_action(self, state: SubstrateState, affordances: Dict) -> Dict:
-        """State-driven reflexes. Full 9-action manifold."""
+        # v15 Tier 1: SRE action weights — set by apply_structural_weights()
+        self._structural_weights: Dict[str, float] = {}
+
+        # v15.2: cam and egd wired by MentatTriad after construction
+        self.cam: Optional['ControlAsymmetryMeasure'] = None
+        self.egd: Optional['ExteriorGradientDescent'] = None
+
+    def apply_structural_weights(self, action_weights: Dict[str, float]):
+        """
+        v15 Tier 1: bias CNS micro-action selection toward SRE-recommended affordances.
+        Weights persist until next SRE diagnosis (overwritten on next impossibility).
+        """
+        self._structural_weights = action_weights
+
+    def choose_micro_action(self, state: SubstrateState, affordances: Dict,
+                             trace: Optional['StateTrace'] = None,
+                             sre_weights: Optional[Dict] = None,
+                             phi_history: Optional[List[float]] = None) -> Dict:
+        """
+        v15.2 Step 7: gradient alignment as primary scoring mechanism.
+
+        PRIMARY (when gradient and causal_graph available):
+            score = 0.5×grad_align + 0.2×stability + 0.2×cam_align + 0.1×sre_weight
+
+        FALLBACK (bootstrap — no graph yet):
+            score = reflex heuristics (original path)
+
+        CRK pre-action filter applied in both paths.
+
+        v15.3: phi_history added — threads real Φ values into _build_field_state
+        so C7 phi_trend is computed from actual Φ geometry, not trace S/I/P/A records
+        which carry no phi key.
+        """
+        viable = self._build_viable_set(affordances)
+        gradient = getattr(trace, '_last_gradient', {}) if trace else {}
+
+        # ẋ = ∇Φ(x): score every action by how well its predicted channel-space
+        # delta aligns with the current gradient field.
+        #
+        # PredictionOperator.test_virtual() is the authoritative forward model:
+        # primary channel influence + causal graph propagation → channel-space delta.
+        # Both delta and gradient are in channel space — no projection needed.
+        #
+        # Gate: gradient must be non-empty. No causal_graph requirement —
+        # gradient is valid from coverage diagonal even before any edges form.
+        if gradient and self.egd is not None and self.cam is not None:
+            cam_scores = self.cam.get_gradient_aligned_action_map()
+            try:
+                coupling    = state.compression.to_coupling_matrix()
+                have_coupling = True
+            except Exception:
+                coupling    = None
+                have_coupling = False
+
+            scores = {}
+            for action in viable:
+                channel_delta = state.prediction.test_virtual(
+                    compression      = state.compression,
+                    candidate_action = action,
+                    phi_field        = None,   # not used in new implementation
+                    sensing          = state.sensing,
+                )
+                grad_score = self.egd.gradient_align_score(action, channel_delta, gradient)
+
+                # δ²Φ stability — project channel delta to SIPA for coupling matrix
+                if have_coupling:
+                    from uii_operators import CHANNEL_TO_DIM
+                    sipa = {'S': 0.0, 'I': 0.0, 'P': 0.0, 'A': 0.0}
+                    for cid, v in channel_delta.items():
+                        dim = CHANNEL_TO_DIM.get(cid)
+                        if dim:
+                            sipa[dim] += v
+                    stability = self.egd.stability_check(sipa, coupling, ['S', 'I', 'P', 'A'])
+                else:
+                    stability = 0.0
+
+                cam_score  = cam_scores.get(action, 0.0)
+                sre_weight = sre_weights.get(action, 1.0) if sre_weights else 1.0
+                scores[action] = (grad_score                           * 0.6 +
+                                  float(np.clip(stability, 0.0, 1.0)) * 0.2 +
+                                  cam_score                            * 0.1 +
+                                  sre_weight                           * 0.1)
+        else:
+            # No gradient yet — reflex heuristics only
+            scores = self._score_candidates_from_reflexes(viable, state, affordances, sre_weights)
+
+        # CRK pre-action filter.
+        # PHI_MOD_FLOOR: during bootstrap loop_closure=0 → phi_modifier=0 for every
+        # action → all filtered scores zero → max() indeterminate. Floor preserves
+        # gradient ranking through CRK without weakening the coherent=False block.
+        PHI_MOD_FLOOR = 0.05
+        if self.crk is not None and hasattr(state, 'coherence'):
+            field_state = self._build_field_state(state, trace, phi_history)
+            filtered, repairs = {}, []
+            for action in viable:
+                verdict = self.crk.evaluate_pre_action(
+                    proposed_action = action,
+                    coherence       = state.coherence,
+                    sensing         = state.sensing,
+                    compression     = state.compression,
+                    prediction      = state.prediction,
+                    field_state     = field_state,
+                )
+                if verdict.coherent:
+                    mod = max(verdict.phi_modifier, PHI_MOD_FLOOR)
+                    filtered[action] = scores.get(action, 0.0) * mod
+                if verdict.repair:
+                    repairs.append(verdict.repair)
+            if not filtered:
+                filtered = {a: scores.get(a, 0.0) * PHI_MOD_FLOOR for a in viable}
+            if repairs:
+                filtered = self._apply_repair_bias(filtered, repairs[0])
+            best = max(filtered, key=filtered.get)
+        else:
+            best = max(scores, key=scores.get)
+
+        return self._action_from_type(best, state, affordances)
+
+    def _build_viable_set(self, affordances: Dict) -> set:
+        """Translate page state into viable action set."""
+        # These are always available regardless of page state
+        viable = {'observe', 'delay', 'evaluate', 'python', 
+                'llm_query', 'migrate', 'query_agent', 'navigate'}
+        
+        # These require specific page elements to be meaningful
+        if affordances.get('buttons'):  viable.add('click')
+        if affordances.get('readable'): viable.add('read')
+        if affordances.get('inputs'):   viable |= {'fill', 'type'}
+        scrollable = (affordances.get('total_height', 0) -
+                    affordances.get('viewport_height', 0))
+        if scrollable > 0: viable.add('scroll')
+        
+        viable &= SCOREABLE_AFFORDANCES
+        return viable
+
+    def _predict_action_delta(self, action: str, state: SubstrateState) -> Dict[str, float]:
+        """
+        v15.2 Step 7: look up delta from action_substrate_map (genome ledger),
+        fall back to CAM empirical map, return zeros if neither available.
+        """
+        # Primary: inherited action map
+        if action in self.learned_predictions:
+            return dict(self.learned_predictions[action])
+        # Secondary: CAM empirical (live observations)
+        if self.cam is not None:
+            empirical = self.cam.get_empirical_action_map()
+            if action in empirical:
+                return dict(empirical[action])
+        return {'S': 0.0, 'I': 0.0, 'P': 0.0, 'A': 0.0}
+
+    def _score_candidates_from_reflexes(self, candidates: set,
+                                         state: SubstrateState,
+                                         affordances: Dict,
+                                         sre_weights: Optional[Dict]) -> Dict[str, float]:
+        """Score each candidate action using reflex heuristics and SRE weights."""
+        scores = {}
+        for action in candidates:
+            base = 0.1   # default
+            # Heuristic boosts from reflex logic
+            if action == 'read' and state.S < 0.4 and affordances.get('readable'):
+                base = 0.8
+            elif action == 'click' and state.P < 0.4 and affordances.get('buttons'):
+                base = 0.7
+            elif action == 'navigate' and state.P < 0.4 and affordances.get('links'):
+                base = 0.6
+            elif action == 'observe':
+                base = 0.3
+            elif action == 'evaluate':
+                base = 0.4
+            elif action == 'scroll':
+                base = 0.2
+            elif action == 'delay':
+                base = 0.1
+            elif action in ('migrate', 'python', 'llm_query'):
+                base = 0.05   # low base — high impact, reserved for SRE routing
+
+            # SRE weight boost
+            if sre_weights and action in sre_weights:
+                base = base * 0.5 + sre_weights[action] * 0.5
+
+            scores[action] = base
+
+        return scores
+
+    def _build_field_state(self, state: SubstrateState, trace: Optional['StateTrace'],
+                            phi_history: Optional[List[float]] = None) -> Dict:
+        """
+        Build field_state dict for CRK pre-action evaluation.
+
+        v15.3: phi_history parameter added. When present, phi_trend is computed
+        from actual Φ geometry values. Without it, trace records carry only
+        {S, I, P, A} — no 'phi' key — so phi_trend was always 0.0, making C7
+        phi-trend degradation structurally unreachable.
+        """
+        phi_trend = 0.0
+        if phi_history is not None and len(phi_history) >= 3:
+            phi_trend = phi_history[-1] - phi_history[-3]
+        elif trace is not None and len(trace) >= 3:
+            # Legacy fallback: trace records have no 'phi' key in practice,
+            # but kept for any caller that does not pass phi_history.
+            recent = trace.get_recent(3)
+            phi_values = [r.get('phi', 0.0) for r in recent if 'phi' in r]
+            if len(phi_values) >= 2:
+                phi_trend = phi_values[-1] - phi_values[0]
+
+        try:
+            system_load = psutil.cpu_percent() / 100.0
+        except Exception:
+            system_load = 0.0
+
+        p_s = state.coherence.consistency.p_a_consistency if hasattr(state, 'coherence') else 1.0
+
+        return {
+            'phi_trend':        phi_trend,
+            'system_load':      system_load,
+            'p_a_consistency':  p_s,
+        }
+
+    def _apply_repair_bias(self, scores: Dict[str, float], repair: str) -> Dict[str, float]:
+        """Bias action scores toward repair-appropriate actions."""
+        bias_map = {
+            'stabilize':   {'observe': 2.0, 'read': 1.5, 'delay': 1.3},
+            'expand':      {'navigate': 2.0, 'scroll': 1.5, 'click': 1.3},
+            'externalize': {'observe': 1.5, 'read': 1.5, 'evaluate': 1.3},
+            'coordinate':  {'query_agent': 3.0, 'observe': 1.2},
+        }
+        boosts = bias_map.get(repair, {})
+        return {a: s * boosts.get(a, 1.0) for a, s in scores.items()}
+
+    def _action_from_type(self, action_type: str,
+                           state: SubstrateState,
+                           affordances: Dict) -> Dict:
+        """Convert a scored action type back to an executable action dict."""
+        current_url = affordances.get('current_url', '')
+
+        if action_type == 'navigate':
+            links = affordances.get('links', [])
+            available = [l for l in links
+                         if not self.temporal_memory.is_recently_perturbed(
+                             f"{current_url}#nav@{l['url']}")]
+            if available:
+                chosen = available[np.random.randint(len(available))]
+                self.temporal_memory.mark_perturbed(f"{current_url}#nav@{chosen['url']}")
+                return {'type': 'navigate', 'params': {'url': chosen['url']}}
+            return {'type': 'observe', 'params': {}}
+
+        elif action_type == 'click':
+            for b in affordances.get('buttons', []):
+                locus = f"{current_url}#click@{b['selector']}"
+                if not self.temporal_memory.is_recently_perturbed(locus):
+                    self.temporal_memory.mark_perturbed(locus)
+                    return {'type': 'click', 'params': {'selector': b['selector']}}
+            return {'type': 'observe', 'params': {}}
+
+        elif action_type == 'read':
+            for r in affordances.get('readable', []):
+                locus = f"{current_url}#read@{r['selector']}"
+                if not self.temporal_memory.is_recently_perturbed(locus):
+                    self.temporal_memory.mark_perturbed(locus)
+                    return {'type': 'read', 'params': {'selector': r['selector']}}
+            return {'type': 'observe', 'params': {}}
+
+        elif action_type in ('fill', 'type'):
+            inputs = affordances.get('inputs', [])
+            if inputs:
+                inp   = inputs[np.random.randint(len(inputs))]
+                locus = f"{current_url}#{action_type}@{inp['selector']}"
+                if not self.temporal_memory.is_recently_perturbed(locus):
+                    self.temporal_memory.mark_perturbed(locus)
+                    return {'type': action_type,
+                            'params': {'selector': inp['selector'], 'text': 'x'}}
+            return {'type': 'observe', 'params': {}}
+
+        elif action_type == 'scroll':
+            scroll_pos  = affordances.get('scroll_position', 0)
+            total_h     = affordances.get('total_height', 0)
+            viewport_h  = affordances.get('viewport_height', 0)
+            scrollable  = total_h - viewport_h
+            direction   = 'down' if scroll_pos < scrollable else 'up'
+            return {'type': 'scroll', 'params': {'direction': direction, 'amount': 200}}
+
+        elif action_type == 'evaluate':
+            return {
+                'type': 'evaluate',
+                'params': {'script': (
+                    'JSON.stringify({el: document.querySelectorAll("*").length,'
+                    ' txt: document.body.innerText.length,'
+                    ' interactive: document.querySelectorAll("a,button,input,select,textarea").length})'
+                )}
+            }
+
+        elif action_type == 'delay':
+            return {'type': 'delay', 'params': {'duration': 'short'}}
+
+        else:
+            return {'type': action_type, 'params': {}}
+
+    def _choose_micro_action_with_sre_bias(self, state: SubstrateState, affordances: Dict) -> Dict:
+        """Original reflex + SRE bias path — used when CRK unavailable."""
+        action = self._choose_micro_action_reflexes(state, affordances)
+
+        if not self._structural_weights:
+            return action
+
+        reflex_type = action.get('type', 'observe')
+        viable = {'observe', 'delay', 'evaluate'}
+        if affordances.get('links'):    viable.add('navigate')
+        if affordances.get('buttons'):  viable.add('click')
+        if affordances.get('readable'): viable.add('read')
+        if affordances.get('inputs'):   viable |= {'fill', 'type'}
+        scrollable = (affordances.get('total_height', 0) -
+                      affordances.get('viewport_height', 0))
+        if scrollable > 0:              viable.add('scroll')
+
+        viable_weighted = {a: w for a, w in self._structural_weights.items()
+                           if a in viable and w > 0}
+        if not viable_weighted:
+            return action
+
+        best    = max(viable_weighted, key=viable_weighted.get)
+        current = viable_weighted.get(reflex_type, 0.0)
+
+        if best != reflex_type and viable_weighted[best] > current * 1.5:
+            return {'type': best, 'params': {}}
+
+        return action
+
+    def _choose_micro_action_reflexes(self, state: SubstrateState, affordances: Dict) -> Dict:
+        """State-driven reflexes. Full 9-action manifold. (v15: called via choose_micro_action wrapper)"""
         self.action_count += 1
         self.temporal_memory.decay_all()
-
-        if affordances.get('bootstrap_state', False):
-            return {'type': 'observe', 'params': {}}
 
         current_url     = affordances.get('current_url', '')
         scroll_pos      = affordances.get('scroll_position', 0)
@@ -597,14 +1003,18 @@ class CNSMitosisOperator:
         }
 
     def check_triggers(self, state, phi, crk_violations, death_clock) -> Tuple[bool, str]:
-        self.phi_history.append(phi)
+        """
+        DEPRECATED in v15 (Step 3).
 
-        if self._opportunistic_condition(state, phi, crk_violations):
-            return (True, "opportunistic_high_coherence")
+        Mitosis trigger detection has been replaced by the migrate affordance
+        routed through ImpossibilityDetector → SRE substrate_exhaustion path.
+        _opportunistic_condition and _boundary_compression signals have been
+        moved to ImpossibilityDetector.check_impossibility() as substrate_exhaustion inputs.
 
-        if self._boundary_compression(phi, death_clock):
-            return (True, "boundary_compression_survival")
-
+        This method is retained for backward compatibility with v14 log readers
+        but is NOT called from MentatTriad.step() in v15+.
+        Returns (False, "") unconditionally.
+        """
         return (False, "")
 
     def _opportunistic_condition(self, state, phi, crk_violations) -> bool:
@@ -636,8 +1046,8 @@ class CNSMitosisOperator:
 
         for _ in range(self.perturbation_samples):
             perturbed_state = self._bounded_perturb_biased(kernel_state, perturbation_weights)
-            phi_baseline = phi_field.phi(kernel_state, trace, [])
-            phi_perturbed = phi_field.phi(perturbed_state, trace, [])
+            phi_baseline = phi_field.phi_legacy(kernel_state, trace, [])  # v15.2: crk_violations removed from phi()
+            phi_perturbed = phi_field.phi_legacy(perturbed_state, trace, [])  # v15.2: crk_violations removed
             delta_phi = phi_perturbed - phi_baseline
             samples.append(delta_phi)
 
@@ -752,27 +1162,16 @@ class CNSMitosisOperator:
             return (False, "")
 
     def verify_geometry_persistent(self, kernel_path: str) -> bool:
-        if not Path(kernel_path).exists():
-            return False
+        """
+        DEPRECATED in v15 (Step 3).
 
-        try:
-            with open(kernel_path) as f:
-                loaded = json.load(f)
+        kernel_snapshot.json direct file I/O has been removed. Migration outcome
+        is now detected via _classify_migration_outcome() in BrowserRealityAdapter,
+        using observable intermediate signals (PID/network) rather than file verification.
 
-            loaded_topo_hash = self._topology_hash(loaded['control_graph'])
-            parent_topo_hash = self._topology_hash(self.canonical_graph)
-
-            if loaded_topo_hash != parent_topo_hash:
-                return False
-
-            if loaded.get('operator_definitions', {}).get('Phi') != self.phi_definition:
-                return False
-
-            self.substrate_gain_observed = True
-            return True
-
-        except Exception as e:
-            return False
+        Returns False unconditionally.
+        """
+        return False
 
     def _optionality_declining(self) -> bool:
         if len(self.optionality_history) < 5:
@@ -785,8 +1184,20 @@ class CNSMitosisOperator:
 
     def attempt_mitosis(self, triad_state, genome, phi_field,
                        trace, crk_monitor) -> Dict:
-        parent_state = triad_state['substrate_state']
-        child_kernel = self._build_child_kernel(parent_state, genome)
+        """
+        DEPRECATED in v15 (Step 3).
+
+        Migration is now handled via the migrate affordance in BrowserRealityAdapter.
+        The SRE forward pass generates migrate shapes on substrate_exhaustion diagnosis.
+        MigrationHistory (uii_triad.py) tracks outcomes for future SRE shape filtering.
+
+        Returns a no-op dict for backward compatibility.
+        """
+        return {
+            'success': False,
+            'reason': 'deprecated_v15',
+            'pattern': 'use_migrate_affordance',
+        }
 
         closure_ok = self._verify_closure(
             self.canonical_graph,
@@ -863,7 +1274,34 @@ class CNSMitosisOperator:
 # ============================================================
 
 class ImpossibilityDetector:
-    """Detects when CNS cannot maintain coherence autonomously."""
+    """
+    Detects when CNS cannot maintain coherence autonomously.
+
+    v15.3: All triggers updated to read live operator geometry rather than
+    stale scalar proxies. Key changes:
+      - optionality_trap: gated on minimum graph formation; P=0 on empty
+        graph is cold-start, not a trap.
+      - rigidity_crisis: uses smo_v151.plasticity (live) when available;
+        falls back to smo.rigidity for backward compat.
+      - boundary_exhaustion: relative decline threshold (2% of Φ magnitude)
+        plus floor guard — flat at log(O_FLOOR) is formation, not decline.
+      - coherence_collapse: uses consistency_history deque (loop_closure
+        trend) instead of A_drift on the scalar proxy.
+      - dom_stagnation: S-only batch_signal — I/P/A are internally injected
+        and masked dead-Reality signal when included.
+      - prediction_failure: gated on minimum observation_count; high error
+        during graph formation is the grounding signal, not failure.
+      - _graph_formation_phase: single formation guard shared across triggers;
+        suppressed invocations counted for diagnostics.
+    """
+
+    # v15.3 geometry constants
+    _MIN_GRAPH_EDGES   = 3      # minimum causal edges for post-formation logic
+    _MIN_CONFIDENCE    = 0.15   # minimum mean edge confidence
+    _PHI_FLOOR_BAND    = 0.5    # distance from log(O_FLOOR) treated as floor
+    _MORTALITY_THRESHOLD = 0.8
+    _PHI_TREND_WINDOW  = 5
+    _PHI_DECLINE_RELATIVE = -0.02   # 2% of current |Φ| per step
 
     def __init__(self):
         self.micro_perturbation_history = deque(maxlen=50)
@@ -879,19 +1317,55 @@ class ImpossibilityDetector:
         }
 
         self.last_impossibility_reason = None
+        # v15.3: diagnostic counter — how many trigger checks suppressed by formation gate
+        self.formation_suppressed_count: int = 0
+
+    def _graph_formation_phase(self, state: SubstrateState) -> bool:
+        """
+        Returns True while the compression operator is still forming minimum
+        viable causal structure.
+
+        During formation, most impossible-looking states are expected cold-start
+        behaviour. Do not invoke LLM or fire impossibility triggers.
+
+        Formation ends when:
+          - causal_graph has >= _MIN_GRAPH_EDGES edges
+          - mean edge confidence >= _MIN_CONFIDENCE
+          - at least one full loop has closed (loop_closure > 0)
+        """
+        graph = state.compression.causal_graph
+        if len(graph) < self._MIN_GRAPH_EDGES:
+            return True
+        mean_conf = float(np.mean([e.confidence for e in graph.values()]))
+        if mean_conf < self._MIN_CONFIDENCE:
+            return True
+        if state.coherence.consistency.loop_closure < 1e-6:
+            return True
+        return False
 
     def check_impossibility(self,
-                           state: SubstrateState,
-                           smo: SMO,
-                           affordances: Dict,
-                           recent_micro_deltas: List[Dict]) -> Tuple[bool, str]:
-        if affordances.get('bootstrap_state', False):
-            return True, "bootstrap_migration"
+                            state: SubstrateState,
+                            smo: SMO,
+                            affordances: Dict,
+                            recent_micro_deltas: List[Dict],
+                            phi_history: Optional[List[float]] = None,
+                            death_clock=None,
+                            smo_v151=None) -> Tuple[bool, str]:
+        """
+        v15.3: Geometry-corrected triggers. All six triggers now read live
+        operator state rather than scalar proxies.
+
+        smo_v151: optional SelfModifyingOperator — when present, rigidity_crisis
+        switches from smo.rigidity (shadow variable) to smo_v151.plasticity (live).
+        """
 
         self.micro_perturbation_history.extend(recent_micro_deltas)
 
+        # v15.3 dom_stagnation fix: S-only batch_signal.
+        # I, P, A are internally computed and inject constant signal regardless of
+        # Reality state — they masked dead environments when included.
         batch_signal = sum(
-            sum(abs(d.get('observed_delta', {}).get(dim, 0.0)) for dim in ['S', 'I', 'P', 'A'])
+            abs(d.get('observed_delta', {}).get('S', 0.0))
             for d in recent_micro_deltas
         )
         self.recent_signal_magnitudes.append(batch_signal)
@@ -899,36 +1373,93 @@ class ImpossibilityDetector:
         if len(self.micro_perturbation_history) < 10:
             return False, ""
 
+        # ── prediction_failure ────────────────────────────────────────────────
+        # v15.3: gated on observation_count. High prediction error during graph
+        # formation is the grounding signal driving SMO adaptation — not failure.
+        # Only fire when error is sustained and rising despite adaptation.
         recent_error = smo.get_recent_prediction_error(window=10)
         if recent_error > self.thresholds['prediction_error']:
-            self.last_impossibility_reason = "prediction_failure"
-            return True, f"prediction_failure (error={recent_error:.3f})"
+            obs_count = getattr(state.compression, 'observation_count', 0)
+            if obs_count >= 50:
+                if len(smo.prediction_error_history) >= 20:
+                    errors = list(smo.prediction_error_history)[-20:]
+                    trend = float(np.polyfit(range(len(errors)), errors, 1)[0])
+                    if trend > 0.001:   # error flat or rising — adaptation not working
+                        self.last_impossibility_reason = "prediction_failure"
+                        return True, f"prediction_failure (error={recent_error:.3f}, trend={trend:.4f})"
+                else:
+                    # Not enough history for trend — fire on threshold alone
+                    self.last_impossibility_reason = "prediction_failure"
+                    return True, f"prediction_failure (error={recent_error:.3f})"
+            # obs_count < 50 → formation phase, suppress
+            else:
+                self.formation_suppressed_count += 1
 
-        recent_states = [d.get('state_after') for d in list(self.micro_perturbation_history)[-10:] if 'state_after' in d]
-        if len(recent_states) >= 5:
-            A_values = [s['A'] for s in recent_states if 'A' in s]
-            if A_values:
-                A_drift = np.std(A_values)
-                if A_drift > self.thresholds['coherence_drift_rate']:
-                    self.last_impossibility_reason = "coherence_collapse"
-                    return True, f"coherence_collapse (A_drift={A_drift:.3f})"
+        # ── coherence_collapse ────────────────────────────────────────────────
+        # v15.3: uses consistency_history (loop_closure floats) instead of A_drift
+        # on the scalar proxy. CoherenceOperator.apply() appends
+        # consistency.loop_closure — a raw float — to consistency_history.
+        # Read directly as float; getattr on a float always returns the default.
+        consistency_history = list(
+            getattr(state.coherence, 'consistency_history', [])
+        )
+        if len(consistency_history) >= 10:
+            recent_lc = [float(item) for item in consistency_history[-10:]]
+            lc_mean  = float(np.mean(recent_lc))
+            lc_trend = float(np.polyfit(range(len(recent_lc)), recent_lc, 1)[0])
+            lc_peak  = max(recent_lc)
 
-        P_stagnant_count = 0
+            # Fast sustained decline from a formed loop
+            if lc_peak > 0.3 and lc_trend < -0.02:
+                self.last_impossibility_reason = "coherence_collapse"
+                return True, (
+                    f"coherence_collapse (loop_closure trend={lc_trend:.3f})"
+                )
+            # Loop formed, then collapsed hard
+            if lc_peak > 0.5 and lc_mean < 0.2:
+                self.last_impossibility_reason = "coherence_collapse"
+                return True, (
+                    f"coherence_collapse (loop_closure collapsed: "
+                    f"peak={lc_peak:.2f}, mean={lc_mean:.2f})"
+                )
+
+        # ── optionality_trap ─────────────────────────────────────────────────
+        # v15.3: gated on minimum graph formation. With an empty causal graph,
+        # I=0 → P_grounded=0 always. P=0 here is cold-start, not a trap.
+        # A trap requires being stuck somewhere the system cannot escape.
         recent_P_values = []
         for d in list(self.micro_perturbation_history)[-20:]:
             if 'state_after' in d and 'P' in d['state_after']:
                 recent_P_values.append(d['state_after']['P'])
 
         if len(recent_P_values) >= 10:
-            P_variance = np.var(recent_P_values)
-            P_current = state.P
+            if self._graph_formation_phase(state):
+                self.formation_suppressed_count += 1
+            else:
+                # Also require that P was non-zero at some point.
+                # If P has never exceeded 0.05 the graph may still be forming.
+                P_peak = max(recent_P_values)
+                if P_peak >= 0.05:
+                    P_variance = np.var(recent_P_values)
+                    P_current  = state.P
 
-            if (P_current < 0.25 or P_current > 0.85) and P_variance < 0.01:
-                P_stagnant_count = sum(1 for p in recent_P_values if abs(p - P_current) < 0.05)
-                if P_stagnant_count >= self.thresholds['optionality_stagnation_steps']:
-                    self.last_impossibility_reason = "optionality_trap"
-                    return True, f"optionality_trap (P={P_current:.3f}, stagnant={P_stagnant_count})"
+                    if (P_current < 0.25 or P_current > 0.85) and P_variance < 0.01:
+                        P_stagnant_count = sum(
+                            1 for p in recent_P_values if abs(p - P_current) < 0.05
+                        )
+                        if P_stagnant_count >= self.thresholds['optionality_stagnation_steps']:
+                            # Secondary gate: loop_closure intact → P will recover, not a trap
+                            lc_now = state.coherence.consistency.loop_closure
+                            if lc_now <= 0.3:
+                                self.last_impossibility_reason = "optionality_trap"
+                                return True, (
+                                    f"optionality_trap (P={P_current:.3f}, "
+                                    f"stagnant={P_stagnant_count})"
+                                )
 
+        # ── dom_stagnation ────────────────────────────────────────────────────
+        # batch_signal is now S-only (corrected above) so this trigger correctly
+        # detects a dead sensing surface rather than injected I/P noise.
         n_check = self.thresholds['dom_stagnation_steps']
         epsilon = self.thresholds['dom_stagnation_epsilon']
         if len(self.recent_signal_magnitudes) >= n_check:
@@ -936,12 +1467,63 @@ class ImpossibilityDetector:
             consecutive_dead = sum(1 for s in recent_signals if s < epsilon)
             if consecutive_dead >= n_check:
                 self.last_impossibility_reason = "dom_stagnation"
-                return True, f"dom_stagnation (signal < {epsilon} for {n_check} batches)"
+                return True, (
+                    f"dom_stagnation (signal < {epsilon} for {n_check} batches)"
+                )
 
-        rigidity = smo.rigidity
-        if rigidity < self.thresholds['rigidity_boundary'][0] or rigidity > self.thresholds['rigidity_boundary'][1]:
-            self.last_impossibility_reason = "rigidity_crisis"
-            return True, f"rigidity_crisis (rigidity={rigidity:.3f})"
+        # ── rigidity_crisis ───────────────────────────────────────────────────
+        # v15.3: smo.rigidity is a shadow variable — it no longer governs anything
+        # in the model update path. Use smo_v151.plasticity (live) when available.
+        if smo_v151 is not None:
+            plasticity = smo_v151.plasticity
+            smo_consistency = getattr(
+                getattr(state.coherence, 'consistency', None),
+                'smo_consistency', 1.0
+            )
+            if (plasticity < self.thresholds['rigidity_boundary'][0] or
+                    plasticity > self.thresholds['rigidity_boundary'][1]):
+                self.last_impossibility_reason = "rigidity_crisis"
+                return True, f"rigidity_crisis (plasticity={plasticity:.3f})"
+            if smo_consistency < 0.2:
+                self.last_impossibility_reason = "rigidity_crisis"
+                return True, f"rigidity_crisis (smo_consistency={smo_consistency:.3f})"
+        else:
+            # Legacy path: smo_v151 not yet wired — keep original trigger
+            rigidity = smo.rigidity
+            if (rigidity < self.thresholds['rigidity_boundary'][0] or
+                    rigidity > self.thresholds['rigidity_boundary'][1]):
+                self.last_impossibility_reason = "rigidity_crisis"
+                return True, f"rigidity_crisis (rigidity={rigidity:.3f})"
+
+        # ── boundary_exhaustion ───────────────────────────────────────────────
+        # v15.3: relative decline threshold (2% of current |Φ|) replaces the
+        # absolute -0.05 threshold which was invisible noise at the [-100,100]
+        # scale of phi_geometry. Added floor guard: flat at log(O_FLOOR) is
+        # cold-start formation, not structural decline.
+        if phi_history is not None and death_clock is not None:
+            if len(phi_history) >= self._PHI_TREND_WINDOW:
+                recent_phi = phi_history[-self._PHI_TREND_WINDOW:]
+                phi_trend  = float(np.polyfit(range(len(recent_phi)), recent_phi, 1)[0])
+                phi_mean   = float(np.mean(recent_phi))
+                phi_scale  = max(abs(phi_mean), 1.0)
+                phi_declining = phi_trend < self._PHI_DECLINE_RELATIVE * phi_scale
+
+                # Floor guard: Φ stuck at cold-start floor is formation, not decline
+                phi_floor   = float(np.log(PhiField.O_FLOOR))   # ≈ -13.815
+                phi_at_floor = abs(phi_mean - phi_floor) < self._PHI_FLOOR_BAND
+
+                mortality_close = False
+                if hasattr(death_clock, 'get_degradation_progress'):
+                    mortality_close = (
+                        death_clock.get_degradation_progress() > self._MORTALITY_THRESHOLD
+                    )
+
+                if phi_declining and mortality_close and not phi_at_floor:
+                    self.last_impossibility_reason = "boundary_exhaustion"
+                    return True, (
+                        f"boundary_exhaustion (phi_trend={phi_trend:.3f}, "
+                        f"mortality={death_clock.get_degradation_progress():.2f})"
+                    )
 
         return False, ""
 
@@ -1035,11 +1617,11 @@ class AutonomousTrajectoryLab:
             # Pass delta as its own predicted_delta so SMO records zero prediction error.
             # Virtual execution is thinking, not acting. Internal state must be frictionless.
             test_state.apply_delta(propagated_delta, predicted_delta=propagated_delta)
-            test_trace.record(test_state)
+            test_trace.record(test_state, virtual=True)  # v15.2: virtual=True, C_local not recorded
             step_violations = self.crk.evaluate(test_state, test_trace, propagated_delta)
             violations_accumulated.extend(step_violations)
 
-        virtual_phi = self.phi_field.phi(test_state, test_trace, violations_accumulated)
+        virtual_phi = self.phi_field.phi(test_state, test_trace)  # v15.2: crk_violations removed
         candidate.virtual_phi = virtual_phi
         return candidate, virtual_phi
 
@@ -1091,7 +1673,7 @@ class AutonomousTrajectoryLab:
             step_violations = self.crk.evaluate(test_state, test_trace, delta)
             violations_accumulated.extend(step_violations)
 
-        phi_final = self.phi_field.phi(test_state, test_trace, violations_accumulated)
+        phi_final = self.phi_field.phi(test_state, test_trace)  # v15.2: crk_violations removed
 
         candidate.tested = True
         candidate.test_phi_final = phi_final
@@ -1117,6 +1699,91 @@ class AutonomousTrajectoryLab:
                 print(f"  {status} [{i+1}/{manifold.size()}] {len(candidate.steps)} steps: {phi_str}")
 
         return manifold
+
+    # ── v15.2 Step 11: SRE shape intake + path integral scoring ─────────────
+
+    def run(self, state: SubstrateState, trace: StateTrace,
+            sre_shapes: List[Dict],
+            phi_field: 'PhiField') -> Optional[Dict]:
+        """
+        v15.2 Step 11: Execute candidate shapes and score by path integral of C_local.
+        sre_shapes: from SRE._forward_pass() (geometrically derived).
+        Falls back to MigrationShapeLibrary if sre_shapes empty.
+        Returns best_shape dict or None.
+        """
+        shapes = sre_shapes if sre_shapes else self._shapes_from_library(state)
+        if not shapes:
+            return None
+
+        best_shape, best_score = None, -np.inf
+        for shape in shapes:
+            traj_states, grad_history = self._execute_virtual(shape, state, phi_field)
+            score = self._score_trajectory(traj_states, grad_history, phi_field)
+            if score > best_score:
+                best_score, best_shape = score, shape
+        return best_shape
+
+    def _score_trajectory(self,
+                           trajectory_states: List[SubstrateState],
+                           gradient_history:  List[Dict[str, float]],
+                           phi_field:         'PhiField') -> float:
+        """
+        Q(τ) = 0.7 × mean(C_local along τ) + 0.3 × terminal Φ
+
+        Path quality: did the trajectory stay aligned with the field?
+        Terminal Φ: did it end somewhere with real structure?
+        70/30 weight: endpoint Φ selects for lucky jumps; path integral for coherent paths.
+        """
+        if not trajectory_states:
+            return 0.0
+        c_locals = []
+        for i, st in enumerate(trajectory_states):
+            grad    = gradient_history[i] if i < len(gradient_history)                       else phi_field.gradient(st, None)
+            c_local = StateTrace.compute_c_local_static(grad, st.sensing)
+            c_locals.append(c_local)
+        path_quality = float(np.mean(c_locals)) if c_locals else 0.0
+        terminal_phi = phi_field.phi(trajectory_states[-1], None)                        if trajectory_states[-1].compression.causal_graph else 0.0
+        return 0.7 * path_quality + 0.3 * terminal_phi
+
+    def _execute_virtual(self, shape, state: SubstrateState,
+                          phi_field: 'PhiField') -> Tuple[List, List]:
+        """
+        Virtual execution of a shape dict — states flagged _virtual=True.
+        C_local from virtual states never enters trace.c_local_history.
+        Returns (trajectory_states, gradient_history).
+        """
+        if not self._genome:
+            return [], []
+        action_map = self._genome.causal_model.get('action_substrate_map', {})
+        coupling_entry = self._genome.causal_model.get('coupling_matrix', {})
+        coupling_matrix = np.array(coupling_entry.get('matrix', np.eye(4).tolist()))
+
+        test_state = copy.deepcopy(state)
+        action_seq = shape.get('action_sequence', shape.get('delta', {}) and ['observe'])
+        if isinstance(action_seq, str):
+            action_seq = [action_seq]
+
+        traj_states, grad_history = [], []
+        for action_type in action_seq:
+            raw_delta = dict(action_map.get(action_type,
+                             {'S': 0.0, 'I': 0.0, 'P': 0.0, 'A': 0.0}))
+            delta_vec = np.array([raw_delta.get(d, 0.0) for d in ['S', 'I', 'P', 'A']])
+            propagated = coupling_matrix @ delta_vec
+            propagated_delta = {
+                'S': float(propagated[0]), 'I': float(propagated[1]),
+                'P': float(propagated[2]), 'A': float(propagated[3]),
+            }
+            test_state.apply_delta(propagated_delta, predicted_delta=propagated_delta)
+            setattr(test_state, '_virtual', True)
+            grad = phi_field.gradient(test_state, None) if test_state.compression.causal_graph else {}
+            traj_states.append(copy.deepcopy(test_state))
+            grad_history.append(grad)
+        return traj_states, grad_history
+
+    def _shapes_from_library(self, state: SubstrateState) -> List[Dict]:
+        """Fallback: warm-start cache of validated shapes (MigrationShapeLibrary stub)."""
+        # Returns empty list when library not populated — geometric shapes take priority
+        return []
 
 
 # ============================================================

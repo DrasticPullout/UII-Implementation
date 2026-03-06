@@ -35,19 +35,24 @@ from typing import Dict, List, Optional
 # CONSTANTS (must mirror uii_v14_1.py exactly)
 # ============================================================
 
-LAYER1_PARAMS = ['S_bias', 'I_bias', 'P_bias', 'A_bias', 'rigidity_init', 'phi_coherence_weight']
+LAYER1_PARAMS = ['s_coverage_mean', 'p_horizon_norm', 'a_loop_closure',
+                 'rigidity_init', 'phi_coherence_weight']
 
 VELOCITY_FIELD = {
-    'S_bias': 'S_velocity',
-    'I_bias': 'I_velocity',
-    'P_bias': 'P_velocity',
-    'A_bias': 'A_velocity',
-    'rigidity_init': 'rigidity_init_velocity',
+    's_coverage_mean':      's_coverage_mean_velocity',
+    'p_horizon_norm':       'p_horizon_norm_velocity',
+    'a_loop_closure':       'a_loop_closure_velocity',
+    'rigidity_init':        'rigidity_init_velocity',
     'phi_coherence_weight': 'phi_coherence_velocity',
 }
 
 LINEAGE_WINDOW = 5          # Keep last N generations in lineage_history
 SUMMARY_VECTOR_THRESHOLD = 1000  # Prune to slope/intercept at G >= this
+
+
+class PeakOptionalityTracker:
+    """Minimal mirror of uii_triad.PeakOptionalityTracker — constants only, for diagnostics."""
+    MIN_OBS: int = 20
 
 
 # ============================================================
@@ -141,10 +146,13 @@ def read_last_session_end(log_path: str) -> Optional[Dict]:
 
 def build_lineage_entry(child_genome: Dict, session_end: Dict) -> Dict:
     """Build a lineage_history entry from the current session's results."""
+    peak = session_end.get('peak_optionality_snapshot') or {}
     return {
         'generation': child_genome.get('generation', 0),
         'genome_snapshot': {p: child_genome.get(p, 0.5) for p in LAYER1_PARAMS},
         'fitness': session_end.get('fitness', {}).get('survival_time', 0),
+        'peak_vol_opt': peak.get('peak_vol_opt', None),
+        'peak_step': peak.get('peak_step', None),
         'richness_summary': session_end.get('genome_richness_final', {}),
         'timestamp': session_end.get('timestamp', 0),
     }
@@ -169,14 +177,43 @@ def print_diagnostics(child_genome: Dict, velocities: Dict, velocity_weight_note
     print(f"GENOME EXTRACTION — v14.1 — Generation {generation}")
     print("=" * 70)
 
-    # Layer 1 + velocities
-    print("\n[LAYER 1: BIAS + VELOCITY]")
+    # Peak optionality
+    peak = session_end.get('peak_optionality_snapshot')
+    print(f"\n[PEAK OPTIONALITY — L2 SOURCE]")
+    if peak:
+        peak_coupling = peak.get('l2_coupling_matrix', {})
+        peak_obs = peak_coupling.get('observations', 0)
+        l2_source = 'peak ✓' if peak_obs >= 50 else f'terminal (peak obs={peak_obs} < 50)'
+        print(f"  Peak Vol_opt:             {peak['peak_vol_opt']:.4f}  (step {peak['peak_step']})")
+        print(f"  Peak coupling confidence: {peak_coupling.get('confidence', 0.0):.3f}")
+        print(f"  Peak coupling obs:        {peak_obs}")
+        print(f"  L2 coupling source:       {l2_source}")
+    else:
+        print(f"  No peak snapshot — session observations < {PeakOptionalityTracker.MIN_OBS}")
+        print(f"  L2 coupling source:       terminal")
+
+    # Layer 1 scalar targets + velocities
+    print(f"\n[LAYER 1: OPERATOR GEOMETRY SCALARS + VELOCITY]")
     for param in LAYER1_PARAMS:
         vel_field = VELOCITY_FIELD[param]
         bias = child_genome.get(param, 0.0)
         vel = velocities.get(param, 0.0)
         direction = "↑" if vel > 0.005 else ("↓" if vel < -0.005 else "→")
-        print(f"  {param:25s} = {bias:.4f}  {vel_field:30s} = {vel:+.5f} {direction}")
+        print(f"  {param:25s} = {bias:.4f}  {vel_field:35s} = {vel:+.5f} {direction}")
+
+    # Layer 1b: operator geometry dicts
+    print(f"\n[LAYER 1b: OPERATOR GEOMETRY]")
+    s_ch = child_genome.get('operator_s_channels', {})
+    p_acc = child_genome.get('operator_p_accuracy', {})
+    p_hor = child_genome.get('operator_p_horizon', 0)
+    a_sig = child_genome.get('operator_a_signature', {})
+    print(f"  S channels inherited:  {len(s_ch)}")
+    if s_ch:
+        mean_cov = sum(v.get('coverage', 0) for v in s_ch.values()) / len(s_ch)
+        print(f"  S mean coverage:       {mean_cov:.3f}")
+    print(f"  P accuracy channels:   {len(p_acc)}")
+    print(f"  P realized_horizon:    {p_hor} steps")
+    print(f"  A signature keys:      {list(a_sig.keys())}")
 
     # Layer 2
     causal = child_genome.get('causal_model', {})

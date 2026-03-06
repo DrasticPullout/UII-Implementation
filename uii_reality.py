@@ -24,6 +24,8 @@ import time
 import json
 from collections import deque
 
+import hashlib
+
 from uii_types import (
     BASE_AFFORDANCES, SUBSTRATE_DIMS,
     SubstrateState, StateTrace,
@@ -220,7 +222,7 @@ class BrowserRealityAdapter(RealityAdapter):
         self.page = self.context.new_page()
 
         try:
-            self.page.goto('about:blank', wait_until='domcontentloaded', timeout=5000)
+            self.page.goto('https://zenodo.org/records/18017374', wait_until='domcontentloaded', timeout=15000)
             self.initialized = True
         except Exception as e:
             raise ConnectionRefusedError(f"Reality connection failed: {e}") from e
@@ -240,8 +242,7 @@ class BrowserRealityAdapter(RealityAdapter):
                     'page_title': '',
                     'scroll_position': 0,
                     'viewport_height': 0,
-                    'total_height': 0,
-                    'bootstrap_state': True
+                    'total_height': 0
                 }
 
             if current_url != 'about:blank':
@@ -522,6 +523,22 @@ class BrowserRealityAdapter(RealityAdapter):
             elif action_type == 'python':
                 return self._execute_python(params, before_metrics)
 
+            elif action_type == 'migrate':
+                # Step 3: Migration affordance.
+                # Executes code, observes substrate change, returns directional delta only.
+                # Magnitudes are learned by coupling matrix — not prescribed here.
+                code = params.get('code', '')
+                verify_delay = params.get('verify_delay', 2.0)
+                pre_state  = self._snapshot_substrate()
+                result_ctx = self._run_migration_code(code, before_metrics)
+                time.sleep(verify_delay)
+                post_state = self._snapshot_substrate()
+                outcome    = self._classify_migration_outcome(pre_state, post_state, result_ctx)
+                delta, ctx = self._migration_delta_from_outcome(outcome, before_metrics)
+                ctx['migration_outcome'] = outcome
+                ctx['migration_code_hash'] = hashlib.sha256(code.encode()).hexdigest()[:16] if code else ''
+                return delta, ctx
+
             else:
                 pass
 
@@ -554,13 +571,12 @@ class BrowserRealityAdapter(RealityAdapter):
          state=state,
      )
 
-        if boundary_pressure > 0.0:
-         pressure_damping = (1.0 - 0.7 * boundary_pressure)
-         delta['S'] *= pressure_damping
-         delta['S'] += np.random.uniform(
-             -0.01 * boundary_pressure,
-              0.01 * boundary_pressure
-         )
+        # v15: S damping removed. S must report reality as-is at all pressures.
+        # High boundary pressure is precisely when the Triad most needs accurate
+        # environmental sensing to find escape routes. Damping S under pressure
+        # inverts the correct urgency response and degrades coupling matrix accuracy
+        # at the moment SRE needs it most. Phi field and CRK constraints handle
+        # coherence — S does not need external damping.
 
         context = {
             'before': before_metrics,
@@ -577,7 +593,29 @@ class BrowserRealityAdapter(RealityAdapter):
         self.previous_dom_metrics = after_metrics
 
         return delta, context
-
+    
+    def execute_trajectory(self, trajectory: List[Dict]) -> Tuple[List[Dict], bool]:
+        """
+        Execute a sequence of steps and return perturbation trace.
+        
+        Returns (perturbation_trace, success) where:
+        - perturbation_trace: list of {'action': step, 'delta': measured_delta}
+        - success: False if any step raises, True if all complete
+        """
+        perturbation_trace = []
+        try:
+            for step in trajectory:
+                delta, context = self.execute(step)
+                perturbation_trace.append({
+                    'action': step,
+                    'delta':  delta,
+                    'context': context,
+                })
+            return perturbation_trace, True
+        except Exception as e:
+            # Partial trace returned — caller falls back to observe
+            return perturbation_trace, False
+    
     def _query_agent(self, params: Dict, before_metrics: Dict) -> Tuple[Dict, Dict]:
         """Query an agent (non-blocking)."""
         agent_name = params.get('agent', 'user')
@@ -661,7 +699,125 @@ class BrowserRealityAdapter(RealityAdapter):
                 }
             )
 
-    def execute_trajectory(self, trajectory: List[Dict]) -> Tuple[List[Dict], bool]:
+    def _snapshot_substrate(self) -> Dict:
+        """
+        Step 3: Snapshot observable substrate signals for migration outcome detection.
+        Captures process-level and network-level signals that would change on spawn.
+        Observable only — no internal Triad state.
+        """
+        import os, subprocess
+        snapshot = {
+            'pid': os.getpid(),
+            'timestamp': time.time(),
+        }
+        try:
+            # Count child processes as a spawn signal
+            result = subprocess.run(
+                ['pgrep', '-P', str(os.getpid())],
+                capture_output=True, text=True, timeout=1.0
+            )
+            snapshot['child_pids'] = result.stdout.strip().split('\n') if result.stdout.strip() else []
+        except Exception:
+            snapshot['child_pids'] = []
+        try:
+            # Count open network connections as a substrate signal
+            result = subprocess.run(
+                ['ss', '-tn', 'state', 'established'],
+                capture_output=True, text=True, timeout=1.0
+            )
+            snapshot['network_connections'] = len(result.stdout.strip().split('\n'))
+        except Exception:
+            snapshot['network_connections'] = 0
+        return snapshot
+
+    def _run_migration_code(self, code: str, before_metrics: Dict) -> Dict:
+        """
+        Step 3: Execute migration code. Returns result context (not a full delta tuple).
+        Distinct from _execute_python: does not return a delta, only execution status.
+        """
+        import os
+        if not code:
+            return {'exception': ValueError('migrate requires code'), 'succeeded': False}
+        cwd = os.getcwd()
+        exec_globals = {'__builtins__': __builtins__, 'cwd': cwd}
+        exec_locals = {}
+        try:
+            exec(code, exec_globals, exec_locals)
+            return {
+                'succeeded': True,
+                'result': exec_locals.get('result', None),
+            }
+        except Exception as e:
+            return {
+                'succeeded': False,
+                'exception': e,
+            }
+
+    def _classify_migration_outcome(self, pre: Dict, post: Dict, result_ctx: Dict) -> str:
+        """
+        Step 3: Classify migration outcome from observable intermediate signals only.
+
+        Signal table (from spec):
+          _execute raised exception       → coherence_loss
+          No exception, no spawn          → serialized_only
+          Spawn confirmed (PID / network) → spawn_attempted
+          Handshake received              → handshake_received (stubbed as spawn_attempted
+                                           until handshake protocol is explicit — per spec)
+        """
+        if not result_ctx.get('succeeded', False):
+            return 'coherence_loss'
+
+        # Check for new child processes (spawn signal)
+        pre_pids  = set(pre.get('child_pids', []))
+        post_pids = set(post.get('child_pids', []))
+        new_pids  = post_pids - pre_pids
+
+        # Check for new network connections (spawn signal)
+        pre_net  = pre.get('network_connections', 0)
+        post_net = post.get('network_connections', 0)
+        new_connections = post_net - pre_net
+
+        if new_pids or new_connections > 0:
+            # OPEN: handshake_received stubbed as spawn_attempted until protocol is explicit
+            return 'spawn_attempted'
+
+        return 'serialized_only'
+
+    def _migration_delta_from_outcome(self, outcome: str, before_metrics: Dict) -> Tuple[Dict[str, float], Dict]:
+        """
+        Step 3: Directional delta only. No fixed magnitudes — learned by coupling matrix.
+
+        Outcome → Direction:
+          serialized_only  → I ↑   (compression event — state made transmissible)
+          spawn_attempted  → S ↑   (new causal surface opened)
+          handshake_received → S ↑, P ↑  (environment responded — gradient nonzero)
+          silent failure   → no movement
+          coherence_loss   → A ↓, P ↓  (attempt destabilised current attractor)
+
+        Magnitude = 0.01 directional nudge. Actual magnitudes learned by CouplingMatrixEstimator.
+        """
+        DIRECTION_SCALE = 0.01   # minimal nudge — magnitude is CouplingMatrixEstimator's job
+
+        if outcome == 'serialized_only':
+            delta = {'S': 0.0, 'I': +DIRECTION_SCALE, 'P': 0.0, 'A': 0.0}
+        elif outcome == 'spawn_attempted':
+            delta = {'S': +DIRECTION_SCALE, 'I': 0.0, 'P': 0.0, 'A': 0.0}
+        elif outcome == 'handshake_received':
+            delta = {'S': +DIRECTION_SCALE, 'I': 0.0, 'P': +DIRECTION_SCALE, 'A': 0.0}
+        elif outcome == 'coherence_loss':
+            delta = {'S': 0.0, 'I': 0.0, 'P': -DIRECTION_SCALE, 'A': -DIRECTION_SCALE}
+        else:
+            # silent failure — no movement
+            delta = {'S': 0.0, 'I': 0.0, 'P': 0.0, 'A': 0.0}
+
+        ctx = {
+            'before':           before_metrics,
+            'after':            before_metrics,
+            'action_succeeded': outcome not in ('coherence_loss',),
+            'refusal':          False,
+            'migrate_outcome':  outcome,
+        }
+        return delta, ctx
         """Execute entire trajectory, returning perturbation trace."""
         perturbation_trace = []
 
