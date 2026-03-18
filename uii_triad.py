@@ -49,7 +49,7 @@ v16 changes vs v15.3:
 Unchanged from v15.3:
   - Full operator update sequence (sensing → compression → prediction → coherence)
   - CRK pre-action + post-action evaluation; SMO C1 rollback
-  - AttractorMonitor, ResidualTracker/Explainer/AxisAdmission, FAO
+  - ResidualTracker/Explainer/AxisAdmission, FAO
   - _compute_a(), _compute_delta_i(), _build_env_signal()
   - MigrationAttempt run-local tracking; migration_geometry merge in FAO
   - StepLog (v16 fields added; deprecated v14/v15 fields retained for log compat)
@@ -74,6 +74,7 @@ from uii_geometry import (
     CRKEvaluation, CRKVerdict,
     expected_optionality_gain, eigen_decompose,
     SymbolGroundingAdapter,
+    GroundingSpec,                              # v16.1: geometric grounding context
 )
 from uii_operators import (
     SensingOperator, CompressionOperator, PredictionOperator,
@@ -84,7 +85,7 @@ from uii_ledger import (
     TriadLedger, PeakOptionalityTracker,
     load_ledger, save_ledger,
 )
-from uii_reality import AttractorMonitor, CouplingMatrixEstimator, BrowserRealityAdapter
+from uii_reality import CouplingMatrixEstimator, BrowserRealityAdapter
 from uii_fao import (
     ResidualTracker, ResidualExplainer, AxisAdmissionTest,
     classify_relation_failure, FailureAssimilationOperator,
@@ -119,6 +120,25 @@ def _compute_gradient_diagnostics(gradient: Dict[str, float],
     nonzero = p[p > 0]
     entropy = float(-np.sum(nonzero * np.log(nonzero)))
     return entropy, active_count
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# v16.2 constants — pre-commit sensing loop
+# ──────────────────────────────────────────────────────────────────────────────
+
+PRE_COMMIT_MAX_ITERATIONS   = 5
+# Hard cap on pre-commit loop iterations. Prevents runaway during bootstrap
+# when prediction errors are noisy and SMO threshold never fires.
+
+SMO_CONVERGENCE_THRESHOLD   = 0.02
+# get_recent_prediction_error(window=3) below this → operators are informed,
+# stop sensing and proceed to commit. Derived from SMO EPSILON=0.1/step:
+# error of 0.02 means SMO updates are <20% of max magnitude — converged.
+
+PRE_COMMIT_REFETCH_ACTIONS  = {'navigate', 'click'}
+# Actions that may change the page — affordances re-fetched after these only.
+# fill/type falls back to observe without grounding (cannot mutate DOM).
+# evaluate uses fixed diagnostic script (read-only).
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -177,6 +197,8 @@ class MigrationAttempt:
 @dataclass
 class StepLog:
     """
+    v16.2: micro_perturbations_executed → pre_commit_iterations (adaptive count 1-5).
+           micro_perturbation_trace → pre_commit_trace.
     v16: Added Hessian geometry fields. Deprecated SRE/mitosis/death-clock fields
     retained as defaults for log backward compatibility.
     """
@@ -184,8 +206,8 @@ class StepLog:
     timestamp:                    float
     state_before:                 Dict[str, float]
     phi_before:                   float
-    micro_perturbations_executed: int
-    micro_perturbation_trace:     List[Dict]
+    pre_commit_iterations:        int          # v16.2: adaptive loop count (1-PRE_COMMIT_MAX_ITERATIONS)
+    pre_commit_trace:             List[Dict]   # v16.2: pre-commit action/delta records
     committed_action:             Optional[str]   = None    # v16: scored action type
     committed_phi:                Optional[float] = None
     state_after:                  Dict[str, float] = field(default_factory=dict)
@@ -249,10 +271,6 @@ class StepLog:
     action_map_affordances:       int    = 0
     discovered_axes:              int    = 0
     residual_explanation:         Optional[str] = None
-    # Attractor
-    attractor_status:             str    = 'accumulating_stability_data'
-    freeze_verified:              bool   = False
-    attractor_identity_hash:      Optional[str] = None
     # Backward-compat deprecated fields (v14/v15 — no longer populated)
     llm_invoked:                  bool   = False
     trajectories_enumerated:      int    = 0
@@ -443,13 +461,12 @@ class MentatTriad:
     """
 
     def __init__(self,
-                 intelligence:                  SymbolGroundingAdapter,
-                 reality:                       RealityAdapter,
-                 micro_perturbations_per_check: int              = 10,
-                 log_path:                      str              = 'mentat_triad_v16_log.jsonl',
-                 step_budget:                   int              = 100,
-                 ledger:                        Optional[TriadLedger] = None,
-                 log_mode:                      str              = 'minimal'):
+                 intelligence:          SymbolGroundingAdapter,
+                 reality:               RealityAdapter,
+                 log_path:              str              = 'mentat_triad_v16_log.jsonl',
+                 step_budget:           int              = 100,
+                 ledger:                Optional[TriadLedger] = None,
+                 log_mode:              str              = 'minimal'):
 
         self.intelligence  = intelligence
         self.reality       = reality
@@ -560,10 +577,6 @@ class MentatTriad:
         # ── Temporal memory (moved from ContinuousRealityEngine) ─────────────
         self.temporal_memory = TemporalPerturbationMemory(window_steps=5, capacity=20)
 
-        # ── Attractor monitor ─────────────────────────────────────────────────
-        self.attractor_monitor = AttractorMonitor(stability_window=10, phi_epsilon=0.01)
-        self.reality.attractor_monitor_ref = self.attractor_monitor
-
         # ── FAO + residual stack ──────────────────────────────────────────────
         self.fao              = FailureAssimilationOperator(memory_decay=0.95, inheritance_noise=0.1)
         self.residual_tracker = ResidualTracker(maxlen=200)
@@ -578,8 +591,6 @@ class MentatTriad:
         self.phi_history: List[float]  = []
         self.step_history: List[StepLog] = []
         self.fitness_metrics = {
-            'freeze_achieved':    False,
-            'freeze_step':        None,
             'survival_time':      0,
             'final_phi':          0.0,
             'migration_attempted': False,
@@ -591,19 +602,18 @@ class MentatTriad:
         self.log_file  = open(log_path, 'a')
 
         self.log_file.write(json.dumps({
-            'event':              'session_start',
-            'version':            '16',
-            'timestamp':          time.time(),
-            'triad_id':           self.triad_id,
-            'coupling_confidence': self.coupling_estimator.get_confidence(),
-            'coupling_observations': self.coupling_estimator.observation_count,
-            'micro_perturbations_per_check': micro_perturbations_per_check,
-            'step_budget':         step_budget,
+            'event':                    'session_start',
+            'version':                  '16.2',
+            'timestamp':                time.time(),
+            'triad_id':                 self.triad_id,
+            'coupling_confidence':      self.coupling_estimator.get_confidence(),
+            'coupling_observations':    self.coupling_estimator.observation_count,
+            'pre_commit_max_iterations': PRE_COMMIT_MAX_ITERATIONS,
+            'smo_convergence_threshold': SMO_CONVERGENCE_THRESHOLD,
+            'step_budget':              step_budget,
             'inherited_ledger_has_hessian': bool(ledger.hessian_snapshot),
         }, default=_json_default) + '\n')
         self.log_file.flush()
-
-        self.micro_perturbations_per_check = micro_perturbations_per_check
 
         if ledger.hessian_snapshot:
             vo = ledger.hessian_snapshot.get('vol_opt', 0.0)
@@ -619,8 +629,19 @@ class MentatTriad:
     def _get_page_viable_actions(self, affordances: Dict) -> List[str]:
         """
         Page-available actions from current affordances.
+
+        v16.1 fix (Bug A): navigate is always added to the viable set.
+        When links=[], _action_dict_from_type will call ground_symbol to
+        generate a novel URL rather than silently falling back to observe.
+        Previously navigate was unconditionally added but had no URL generation
+        capability, causing it to silently execute as observe every step.
+
         Always available: observe, delay, evaluate, python, llm_query, migrate, navigate.
-        Conditional on page elements: click, read, fill, type, scroll.
+        Conditional on DOM state:
+            click     — buttons present
+            read      — readable elements present
+            fill/type — inputs present
+            scroll    — page taller than viewport
         """
         viable = {'observe', 'delay', 'evaluate', 'python', 'llm_query', 'migrate', 'navigate'}
         if affordances.get('buttons'):   viable.add('click')
@@ -628,7 +649,7 @@ class MentatTriad:
         if affordances.get('inputs'):    viable |= {'fill', 'type'}
         scrollable = (affordances.get('total_height', 0) -
                       affordances.get('viewport_height', 0))
-        if scrollable > 0:              viable.add('scroll')
+        if scrollable > 0:               viable.add('scroll')
         return list(viable - {'migrate', 'python', 'llm_query'})   # LLM actions reserved
 
     def _score_reflexes(self, viable: List[str], affordances: Dict) -> Dict[str, float]:
@@ -645,47 +666,89 @@ class MentatTriad:
             scores[a] = base
         return scores
 
-    def _action_dict_from_type(self, action_type: str, affordances: Dict) -> Dict:
-        """Convert scored action type to executable action dict. Mirrors CRE._action_from_type."""
+    def _action_dict_from_type(self, action_type: str, affordances: Dict,
+                               check_temporal: bool = True,
+                               grounding_spec: Optional[GroundingSpec] = None) -> Dict:
+        """
+        Convert scored action type to executable action dict.
+
+        v16.1 changes:
+        - grounding_spec parameter: when provided, symbolic actions call
+          intelligence.ground_symbol() to fill their token.
+          When None (micro-perturbation loop), no LLM calls are made.
+        - Bug B fix: fallbacks tagged with '_fallback_from' so Phase 5
+          can detect and log the degradation instead of silently swallowing it.
+        - navigate: DOM links used when available (free). When empty,
+          ground_symbol called if grounding_spec provided. Then observe+tag.
+        - fill/type: content grounded from field spec instead of hardcoded 'x'.
+        - evaluate: JS grounded from dark channels instead of fixed script.
+        - python: code grounded from desired delta. No fallback without grounding.
+        """
         current_url = affordances.get('current_url', '')
 
         if action_type == 'navigate':
-            links     = affordances.get('links', [])
-            available = [l for l in links
-                         if not self.temporal_memory.is_recently_perturbed(
-                             f'{current_url}#nav@{l["url"]}')]
+            links = affordances.get('links', [])
+            if check_temporal:
+                available = [l for l in links
+                             if not self.temporal_memory.is_recently_perturbed(
+                                 f'{current_url}#nav@{l["url"]}')]
+            else:
+                available = links
+
             if available:
+                # DOM links exist — sample them (free, no LLM)
                 chosen = available[np.random.randint(len(available))]
                 self.temporal_memory.mark_perturbed(f'{current_url}#nav@{chosen["url"]}')
                 return {'type': 'navigate', 'params': {'url': chosen['url']}}
-            return {'type': 'observe', 'params': {}}
+
+            # No DOM links — ground a novel URL if grounding_spec provided
+            if grounding_spec is not None:
+                url = self.intelligence.ground_symbol('navigate', grounding_spec, affordances)
+                if url:
+                    return {'type': 'navigate', 'params': {'url': url}}
+
+            return {'type': 'observe', 'params': {}, '_fallback_from': 'navigate'}
 
         elif action_type == 'click':
             for b in affordances.get('buttons', []):
                 locus = f'{current_url}#click@{b["selector"]}'
-                if not self.temporal_memory.is_recently_perturbed(locus):
+                if not check_temporal or not self.temporal_memory.is_recently_perturbed(locus):
                     self.temporal_memory.mark_perturbed(locus)
                     return {'type': 'click', 'params': {'selector': b['selector']}}
-            return {'type': 'observe', 'params': {}}
+            return {'type': 'observe', 'params': {}, '_fallback_from': 'click'}
 
         elif action_type == 'read':
             for r in affordances.get('readable', []):
                 locus = f'{current_url}#read@{r["selector"]}'
-                if not self.temporal_memory.is_recently_perturbed(locus):
+                if not check_temporal or not self.temporal_memory.is_recently_perturbed(locus):
                     self.temporal_memory.mark_perturbed(locus)
                     return {'type': 'read', 'params': {'selector': r['selector']}}
-            return {'type': 'observe', 'params': {}}
+            return {'type': 'observe', 'params': {}, '_fallback_from': 'read'}
 
         elif action_type in ('fill', 'type'):
             inputs = affordances.get('inputs', [])
             if inputs:
                 inp   = inputs[np.random.randint(len(inputs))]
                 locus = f'{current_url}#{action_type}@{inp["selector"]}'
-                if not self.temporal_memory.is_recently_perturbed(locus):
+                if not check_temporal or not self.temporal_memory.is_recently_perturbed(locus):
                     self.temporal_memory.mark_perturbed(locus)
-                    return {'type': action_type,
-                            'params': {'selector': inp['selector'], 'text': 'x'}}
-            return {'type': 'observe', 'params': {}}
+
+                    # v16.2: no grounding_spec → fall back to observe.
+                    # Entering 'x' is noise — it mutates DOM state without
+                    # producing signal and poisons the coupling matrix.
+                    # The Triad still sees fill/type in the viable set;
+                    # the geometry decides whether to attempt them.
+                    if grounding_spec is None:
+                        return {'type': 'observe', 'params': {}, '_fallback_from': action_type}
+
+                    grounded = self.intelligence.ground_symbol(
+                        action_type, grounding_spec, affordances
+                    )
+                    if grounded:
+                        return {'type': action_type,
+                                'params': {'selector': inp['selector'], 'text': grounded}}
+                    return {'type': 'observe', 'params': {}, '_fallback_from': action_type}
+            return {'type': 'observe', 'params': {}, '_fallback_from': action_type}
 
         elif action_type == 'scroll':
             scroll_pos = affordances.get('scroll_position', 0)
@@ -695,70 +758,32 @@ class MentatTriad:
             return {'type': 'scroll', 'params': {'direction': direction, 'amount': 200}}
 
         elif action_type == 'evaluate':
+            # v16.1: ground JS from dark channels instead of fixed script
+            if grounding_spec is not None:
+                js = self.intelligence.ground_symbol('evaluate', grounding_spec, affordances)
+                if js:
+                    return {'type': 'evaluate', 'params': {'script': js}}
+            # Fallback: fixed diagnostic script (unchanged from v16.0)
             return {'type': 'evaluate', 'params': {'script': (
                 'JSON.stringify({el: document.querySelectorAll("*").length,'
                 ' txt: document.body.innerText.length,'
                 ' interactive: document.querySelectorAll("a,button,input,select,textarea").length})'
             )}}
 
+        elif action_type == 'python':
+            # v16.1: ground code from desired delta
+            if grounding_spec is not None:
+                code = self.intelligence.ground_symbol('python', grounding_spec, affordances)
+                if code:
+                    return {'type': 'python', 'params': {'code': code}}
+            # No fallback for python without grounding
+            return {'type': 'observe', 'params': {}, '_fallback_from': 'python'}
+
         elif action_type == 'delay':
             return {'type': 'delay', 'params': {'duration': 'short'}}
 
         else:
             return {'type': action_type, 'params': {}}
-
-    def _choose_micro_action(self, affordances: Dict) -> Dict:
-        """
-        v16 replacement for ContinuousRealityEngine.choose_micro_action().
-
-        PRIMARY:   Use previous step's Hessian scores if available.
-        FALLBACK:  Reflex heuristics (bootstrap — no Hessian yet).
-        CRK:       Pre-action filter applied in both paths.
-        Temporal:  decay_all() called once per micro-batch start.
-        """
-        viable = self._get_page_viable_actions(affordances)
-        if not viable:
-            return {'type': 'observe', 'params': {}}
-
-        # Score: previous-step Hessian scores → or reflexes
-        if self._last_scores:
-            scores = {a: self._last_scores.get(a, 0.1) for a in viable}
-        else:
-            scores = self._score_reflexes(viable, affordances)
-
-        # CRK pre-action filter
-        PHI_MOD_FLOOR = 0.05
-        try:
-            phi_trend = (self.phi_history[-1] - self.phi_history[-3]
-                         if len(self.phi_history) >= 3 else 0.0)
-            import psutil
-            system_load = psutil.cpu_percent() / 100.0
-        except Exception:
-            phi_trend = system_load = 0.0
-
-        field_state = {
-            'phi_trend':       phi_trend,
-            'system_load':     system_load,
-            'p_a_consistency': self.state.coherence.consistency.p_a_consistency,
-        }
-        filtered = {}
-        for action in viable:
-            verdict = self.crk.evaluate_pre_action(
-                proposed_action = action,
-                coherence       = self.state.coherence,
-                sensing         = self.state.sensing,
-                compression     = self.state.compression,
-                prediction      = self.state.prediction,
-                field_state     = field_state,
-            )
-            if verdict.coherent:
-                mod = max(verdict.phi_modifier, PHI_MOD_FLOOR)
-                filtered[action] = scores.get(action, 0.1) * mod
-        if not filtered:
-            filtered = {a: scores.get(a, 0.1) * PHI_MOD_FLOOR for a in viable}
-
-        best = max(filtered, key=filtered.get)
-        return self._action_dict_from_type(best, affordances)
 
     def _predict_delta(self, action: Dict) -> Dict[str, float]:
         """
@@ -948,25 +973,6 @@ class MentatTriad:
             'binding_constraint':   'steps',
         }
 
-    def get_triad_state(self) -> Dict:
-        """Build current Triad state for attractor monitoring."""
-        violations = self.crk.evaluate(self.state, self.trace, None)
-        phi        = self.phi_field.phi(self.state, self.trace)
-        return {
-            'substrate':           self.state.as_dict(),
-            'viable_affordances':  [],
-            'gated_affordances':   [],
-            'discovered_clusters': [],
-            'control_graph':       {a: len(d) for a, d in
-                                    self.coupling_estimator.affordance_deltas.items()},
-            'prediction_error':    self.state.smo.get_recent_prediction_error(10),
-            'rigidity':            self.state.smo.rigidity,
-            'A':                   self.state.A,
-            'P':                   self.state.P,
-            'crk_violations':      violations,
-            'phi':                 phi,
-        }
-
     # ──────────────────────────────────────────────────────────────────────────
     # step()
     # ──────────────────────────────────────────────────────────────────────────
@@ -982,129 +988,27 @@ class MentatTriad:
             print(f'STEP {self.step_count}')
             print(f'{"="*70}')
 
-        state_before      = self.state.as_dict()
-        violations_before = self.crk.evaluate(self.state, self.trace, None)
-        phi_before        = self.phi_field.phi(self.state, self.trace)
+        state_before = self.state.as_dict()
+        phi_before   = self.phi_field.phi(self.state, self.trace)
         self.phi_history.append(phi_before)
 
         if verbose:
             print(f'State: S={self.state.S:.3f} I={self.state.I:.3f} '
                   f'P={self.state.P:.3f} A={self.state.A:.3f}  Φ={phi_before:.3f}')
 
-        # ── PHASE 1: MICRO-PERTURBATION BATCH ─────────────────────────────────
-        micro_perturbation_trace = []
-        self.temporal_memory.decay_all()   # once per step
-
-        for _i in range(self.micro_perturbations_per_check):
-            affordances        = self.reality.get_current_affordances()
-            action             = self._choose_micro_action(affordances)
-            predicted_delta    = self._predict_delta(action)
-            self._last_predicted_delta = predicted_delta
-
-            state_before_micro = self.state.as_dict()
-
-            observed_delta, context = self.reality.execute(
-                action,
-                state=self.state,
-                coupling_confidence=self.coupling_estimator.get_confidence(),
-            )
-
-            # I: compression quality of S history
-            observed_delta['I'] = self._compute_delta_i()
-
-            # ── Operator update sequence ─────────────────────────────────────
-            prior_compression = self.state.compression
-            env_signal        = self._build_env_signal(observed_delta, context)
-            new_sensing       = self.state.sensing.apply(env_signal, self.state.compression)
-            self._sensing_history.append(new_sensing)
-
-            new_compression   = self.state.compression.apply(self._sensing_history)
-            new_prediction, errors = self.state.prediction.observe_outcome(
-                new_sensing, new_compression
-            )
-            new_compression   = new_compression.absorb_prediction_error(errors)
-            new_prediction    = new_prediction.apply(new_compression)
-            new_coherence     = self.state.coherence.apply(
-                new_sensing, new_compression, new_prediction,
-                smo_updates=self._prev_smo_updates,
-            )
-            self._pending_smo_update = errors
-
-            # Post-action CRK
-            post_verdict = self.crk.evaluate_post_action(
-                proposed_smo_update = errors,
-                observed_delta      = observed_delta,
-                predicted_delta     = predicted_delta,
-                sensing             = new_sensing,
-                compression         = new_compression,
-                prediction          = new_prediction,
-                coherence           = new_coherence,
-                prior_compression   = prior_compression,
-                smo_plasticity      = self.smo_v151.plasticity,
-            )
-            self._last_smo_rollback = False
-
-            if post_verdict.smo_permitted:
-                _pre_apply_plasticity = self.smo_v151.plasticity
-                new_s, new_c, new_p, new_a, smo_updates_list = self.smo_v151.apply(
-                    sensing           = new_sensing,
-                    compression       = new_compression,
-                    prediction        = new_prediction,
-                    coherence         = new_coherence,
-                    observed_delta    = observed_delta,
-                    predicted_delta   = predicted_delta,
-                    prediction_errors = errors,
-                )
-                if post_verdict.repair == 'reattribute':
-                    self.smo_v151.plasticity = min(self.smo_v151.plasticity, _pre_apply_plasticity)
-                    self.smo_v151.rigidity   = 1.0 - self.smo_v151.plasticity
-                self.state = SubstrateState(
-                    sensing=new_s, compression=new_c, prediction=new_p, coherence=new_a
-                )
-                self.state.apply_delta(observed_delta, predicted_delta)
-            else:
-                c1_post = next((e for e in post_verdict.evaluations
-                                if e.constraint == 'C1' and e.blocks), None)
-                compression_to_use = prior_compression if c1_post else new_compression
-                if c1_post:
-                    self._last_smo_rollback = True
-                self.state = SubstrateState(
-                    sensing     = new_sensing,
-                    compression = compression_to_use,
-                    prediction  = self.state.prediction,
-                    coherence   = new_coherence,
-                )
-                self.state.apply_delta(observed_delta, predicted_delta)
-                smo_updates_list = []
-
-            self._prev_smo_updates = smo_updates_list if smo_updates_list else None
-
-            # Gradient
-            _gradient = self.phi_field.gradient(self.state, self.trace)
-            self.trace.record(self.state, _gradient)
-            _grad_entropy, _grad_active = _compute_gradient_diagnostics(_gradient)
-
-            # v16: track affordance deltas via coupling_estimator.update()
-            self.coupling_estimator.update(
-                action['type'], state_before_micro, self.state.as_dict()
-            )
-            self.residual_tracker.record(predicted_delta, observed_delta, context)
-
-            self.total_micro_perturbations += 1
-            micro_perturbation_trace.append({
-                'action':           action,
-                'predicted_delta':  predicted_delta,
-                'observed_delta':   observed_delta,
-                'context':          context,
-                'state_after':      self.state.as_dict(),
-            })
+        # ── PHASE 1: AFFORDANCES FETCH ────────────────────────────────────────
+        # v16.2.1: pre-commit execution loop removed. test_virtual() is now
+        # empirically grounded from coupling_estimator — virtual evaluation
+        # replaces execution-based sensing. One real action per step.
+        self.temporal_memory.decay_all()
+        affordances = self.reality.get_current_affordances()
 
         temporal_exclusions = self.temporal_memory.get_exclusion_count()
 
         # Residual explanation (observe-only — ledger write at run end)
         residual_explanation = None
         if len(self.residual_tracker) >= ResidualExplainer.MIN_RECORDS_FOR_ANALYSIS:
-            explanation         = self.residual_explainer.explain(
+            explanation          = self.residual_explainer.explain(
                 self.residual_tracker, self.coupling_estimator)
             residual_explanation = explanation.get('action')
 
@@ -1121,18 +1025,64 @@ class MentatTriad:
 
         vol_opt = float(np.sum(eigvals[eigvals > 0])) if len(eigvals) > 0 else 0.0
 
-        # ── PHASE 3: PRE-COMPUTE E[Δlog(O)] for all page-available actions ────
-        affordances = self.reality.get_current_affordances()
+        # ── PHASE 3 affordances fetch (moved here so Phase 2b can use current URL) ──
+        affordances  = self.reality.get_current_affordances()
         page_actions = self._get_page_viable_actions(affordances)
+
+        # ── PHASE 2b: GROUNDING SPEC — derive field intent from Hessian ───────
+        # Built once per step from cached Phase 2 output. Passed to
+        # _action_dict_from_type for the committed action only — never used
+        # in the micro-perturbation loop (grounding_spec=None gates that).
+        grounding_spec: Optional[GroundingSpec] = None
+
+        if H.shape[0] > 0:
+            _grad_dict_gs = self.phi_field.gradient(self.state, self.trace)
+            _grad_vec_gs  = np.array([_grad_dict_gs.get(cid, 0.0)
+                                      for cid in active_channels])
+            _ev_safe_gs   = np.where(np.abs(eigvals) > 1e-6,
+                                     eigvals,
+                                     1e-6 * np.sign(eigvals + 1e-12))
+            _H_inv_gs     = eigvecs @ np.diag(1.0 / _ev_safe_gs) @ eigvecs.T
+            _nat_grad_gs  = _H_inv_gs @ _grad_vec_gs
+
+            _desired_delta = {cid: float(_nat_grad_gs[i])
+                              for i, cid in enumerate(active_channels)}
+
+            _grad_mags   = {cid: abs(_grad_dict_gs.get(cid, 0.0))
+                            for cid in active_channels}
+            _median_grad = float(np.median(list(_grad_mags.values()))) \
+                           if _grad_mags else 0.0
+            _dark = [
+                cid for cid in active_channels
+                if (self.state.sensing.channels[cid].coverage < 0.3
+                    and _grad_mags.get(cid, 0.0) > _median_grad)
+            ]
+            _top = sorted(active_channels,
+                          key=lambda cid: abs(_grad_dict_gs.get(cid, 0.0)),
+                          reverse=True)[:5]
+
+            grounding_spec = GroundingSpec(
+                desired_delta         = _desired_delta,
+                dark_channels         = _dark,
+                top_gradient_channels = _top,
+                current_url           = affordances.get('current_url', ''),
+                page_title            = affordances.get('page_title', ''),
+                nat_grad_magnitude    = float(np.linalg.norm(_nat_grad_gs)),
+            )
+
+        # ── PHASE 3: PRE-COMPUTE E[Δlog(O)] for all page-available actions ────
         eog_dict: Dict[str, float] = {}
         for a in page_actions:
             eog_dict[a] = expected_optionality_gain(
                 self.state.prediction, a,
-                self.state.compression, self.state.sensing
+                self.state.compression, self.state.sensing,
+                coupling_estimator=self.coupling_estimator,   # v16.2.1
             )
 
         # ── PHASE 4: BUILD VIABLE SET + SCORE ACTIONS ─────────────────────────
-        viable_actions = [a for a, v in eog_dict.items() if v >= 0.0]
+        # Gate: exclude only actions that meaningfully reduce optionality.
+        # -0.01 rather than 0.0 — EOG near zero is numerical noise, not harm.
+        viable_actions = [a for a, v in eog_dict.items() if v >= -0.01]
 
         if H.shape[0] > 0 and viable_actions:
             scores = self.phi_field.score_actions(
@@ -1147,6 +1097,7 @@ class MentatTriad:
                 prediction            = self.state.prediction,
                 peak_snapshot         = peak_snap,
                 optionality_gain_dict = eog_dict,
+                coupling_estimator    = self.coupling_estimator,   # v16.2.1
             )
             self._last_scores = scores
         else:
@@ -1154,33 +1105,131 @@ class MentatTriad:
             self._last_scores = scores
             viable_actions    = viable_actions or ['observe']
 
-        # ── PHASE 5: EXECUTE BEST SCORED ACTION ───────────────────────────────
+        # ── PHASE 5: EXECUTE COMMITTED ACTION + OPERATOR UPDATE ───────────────
+        # The full S→I→P→A→SMO→S closed loop runs here, on the committed
+        # action. This is the only execution per step. Operators update from
+        # real environment contact, coupling_estimator records the delta.
         committed_action_type = None
         committed_phi         = None
 
+        exec_action = None
         if viable_actions:
             best_type   = max(scores, key=scores.get) if scores else 'observe'
-            best_action = self._action_dict_from_type(best_type, affordances)
-            committed_action_type = best_type
-
-            _delta, _ctx = self.reality.execute(
-                best_action, state=self.state,
-                coupling_confidence=self.coupling_estimator.get_confidence(),
+            best_action = self._action_dict_from_type(
+                best_type,
+                affordances,
+                check_temporal = False,
+                grounding_spec = grounding_spec,
             )
-            self.state.apply_delta(_delta)
-            self.trace.record(self.state)
-            committed_phi = self.phi_field.phi(self.state, self.trace)
+            exec_action           = best_action
+            committed_action_type = best_action['type']
 
             if verbose:
-                print(f'  Committed action: {best_type}  Φ→{committed_phi:.3f}')
+                fallback_from = best_action.get('_fallback_from')
+                if fallback_from:
+                    print(f'  [FALLBACK] {fallback_from} → {committed_action_type} '
+                          f'(no {"links" if fallback_from == "navigate" else "targets"} available)')
         else:
-            # No viable actions at all — fallback observe
-            _delta, _ctx = self.reality.execute(
-                {'type': 'observe', 'params': {}}, state=self.state,
-                coupling_confidence=self.coupling_estimator.get_confidence(),
+            exec_action           = {'type': 'observe', 'params': {}}
+            committed_action_type = 'observe'
+
+        state_before_exec = self.state.as_dict()
+
+        observed_delta, context = self.reality.execute(
+            exec_action, state=self.state,
+            coupling_confidence=self.coupling_estimator.get_confidence(),
+        )
+
+        # I: compression quality of S history
+        observed_delta['I'] = self._compute_delta_i()
+
+        # ── Full S→I→P→A→SMO→S operator sequence ────────────────────────────
+        predicted_delta = self._predict_delta(exec_action)
+        self._last_predicted_delta = predicted_delta
+
+        prior_compression = self.state.compression
+        env_signal        = self._build_env_signal(observed_delta, context)
+        new_sensing       = self.state.sensing.apply(env_signal, self.state.compression)
+        self._sensing_history.append(new_sensing)
+
+        new_compression        = self.state.compression.apply(self._sensing_history)
+        new_prediction, errors = self.state.prediction.observe_outcome(
+            new_sensing, new_compression
+        )
+        new_prediction    = new_prediction.apply(new_compression)
+
+        # Tag observed_delta with P's current horizon so C4 can assess overconfidence
+        # without needing a direct reference to the prediction operator.
+        observed_delta['_realized_horizon'] = new_prediction.realized_horizon
+        new_coherence     = self.state.coherence.apply(
+            new_sensing, new_compression, new_prediction,
+            smo_updates=self._prev_smo_updates,
+        )
+        self._pending_smo_update = errors
+
+        post_verdict = self.crk.evaluate_post_action(
+            proposed_smo_update = errors,
+            observed_delta      = observed_delta,
+            predicted_delta     = predicted_delta,
+            sensing             = new_sensing,
+            compression         = new_compression,
+            prediction          = new_prediction,
+            coherence           = new_coherence,
+            prior_compression   = prior_compression,
+            smo_plasticity      = self.smo_v151.plasticity,
+        )
+        self._last_smo_rollback = False
+
+        if post_verdict.smo_permitted:
+            _pre_apply_plasticity = self.smo_v151.plasticity
+            new_s, new_c, new_p, new_a, smo_updates_list = self.smo_v151.apply(
+                sensing           = new_sensing,
+                compression       = new_compression,
+                prediction        = new_prediction,
+                coherence         = new_coherence,
+                observed_delta    = observed_delta,
+                predicted_delta   = predicted_delta,
+                prediction_errors = errors,
             )
-            self.state.apply_delta(_delta)
-            self.trace.record(self.state)
+            if post_verdict.repair == 'reattribute':
+                self.smo_v151.plasticity = min(self.smo_v151.plasticity, _pre_apply_plasticity)
+                self.smo_v151.rigidity   = 1.0 - self.smo_v151.plasticity
+            self.state = SubstrateState(
+                sensing=new_s, compression=new_c, prediction=new_p, coherence=new_a
+            )
+            self.state.apply_delta(observed_delta, predicted_delta)
+        else:
+            c1_post = next((e for e in post_verdict.evaluations
+                            if e.constraint == 'C1' and e.blocks), None)
+            compression_to_use = prior_compression if c1_post else new_compression
+            if c1_post:
+                self._last_smo_rollback = True
+            self.state = SubstrateState(
+                sensing     = new_sensing,
+                compression = compression_to_use,
+                prediction  = new_prediction,   # always update — observation, not self-modification
+                coherence   = new_coherence,
+            )
+            self.state.apply_delta(observed_delta, predicted_delta)
+            smo_updates_list = []
+
+        self._prev_smo_updates = smo_updates_list if smo_updates_list else None
+
+        # Gradient, coupling matrix, residual tracker
+        _gradient = self.phi_field.gradient(self.state, self.trace)
+        self.trace.record(self.state, _gradient)
+        _grad_entropy, _grad_active = _compute_gradient_diagnostics(_gradient)
+
+        self.coupling_estimator.update(
+            committed_action_type, state_before_exec, self.state.as_dict()
+        )
+        self.residual_tracker.record(predicted_delta, observed_delta, context)
+        self.total_micro_perturbations += 1
+
+        committed_phi = self.phi_field.phi(self.state, self.trace)
+
+        if verbose:
+            print(f'  Committed action: {committed_action_type}  Φ→{committed_phi:.3f}')
 
         # ── PHASE 6: VOL_OPT HISTORY + PEAK TRACKER ───────────────────────────
         self._vol_opt_history.append(vol_opt)
@@ -1194,7 +1243,8 @@ class MentatTriad:
             eog_selected     = eog_dict.get(committed_action_type, 0.0)
             channel_delta = self.state.prediction.test_virtual(
                 self.state.compression, committed_action_type,
-                phi_field=None, sensing=self.state.sensing
+                phi_field=None, sensing=self.state.sensing,
+                coupling_estimator=self.coupling_estimator,   # v16.2.1
             )
             idx = {cid: i for i, cid in enumerate(active_channels)}
             dx = np.zeros(len(active_channels))
@@ -1276,25 +1326,13 @@ class MentatTriad:
         # ── POST-BATCH STATE ───────────────────────────────────────────────────
         self.state.A = self._compute_a()
 
-        violations_after = self.crk.evaluate(self.state, self.trace, None)
-        phi_after        = self.phi_field.phi(self.state, self.trace)
-        state_after      = self.state.as_dict()
+        phi_after   = self.phi_field.phi(self.state, self.trace)
+        state_after = self.state.as_dict()
 
         if verbose:
             print(f'Post-batch: S={self.state.S:.3f} I={self.state.I:.3f} '
                   f'P={self.state.P:.3f} A={self.state.A:.3f}  Φ={phi_after:.3f}  '
                   f'Vol_opt={vol_opt:.4f}  maturity={maturity:.3f}')
-            if violations_after:
-                print(f'  CRK violations: {violations_after}')
-
-        # Attractor
-        triad_state = self.get_triad_state()
-        freeze_verified, attractor_status = \
-            self.attractor_monitor.record_state_signature(triad_state, self.step_count)
-
-        if freeze_verified and not self.fitness_metrics['freeze_achieved']:
-            self.fitness_metrics['freeze_achieved'] = True
-            self.fitness_metrics['freeze_step']     = self.step_count
 
         # FAO reset check
         if self.fao.should_reset_bias(phi_before,
@@ -1304,18 +1342,22 @@ class MentatTriad:
             self.fao.reset_to_baseline()
 
         # ── BUILD StepLog ──────────────────────────────────────────────────────
+        _post_violations = [e.constraint for e in post_verdict.evaluations
+                            if e.status in ('violated', 'degraded')] \
+                           if 'post_verdict' in locals() else []
+
         log = StepLog(
             step                         = self.step_count,
             timestamp                    = time.time(),
             state_before                 = state_before,
             phi_before                   = phi_before,
-            micro_perturbations_executed = len(micro_perturbation_trace),
-            micro_perturbation_trace     = micro_perturbation_trace,
+            pre_commit_iterations        = 0,    # v16.2.1: loop removed
+            pre_commit_trace             = [],   # v16.2.1: loop removed
             committed_action             = committed_action_type,
             committed_phi                = committed_phi,
             state_after                  = state_after,
             phi_after                    = phi_after,
-            crk_violations               = violations_after,
+            crk_violations               = _post_violations,
             temporal_exclusions          = temporal_exclusions,
             reality_context              = {
                 'current_url': affordances.get('current_url', ''),
@@ -1388,58 +1430,75 @@ class MentatTriad:
             action_map_affordances       = len(self.coupling_estimator.get_empirical_action_map()),
             discovered_axes              = len(self.ledger.discovered_structure),
             residual_explanation         = residual_explanation,
-            attractor_status             = attractor_status,
-            freeze_verified              = freeze_verified,
-            attractor_identity_hash      = self.attractor_monitor.get_identity_hash(),
         )
 
         # ── LOGGING ────────────────────────────────────────────────────────────
         if self.log_mode == 'minimal':
             self.log_file.write(json.dumps({
-                'event':                 'step_log',
-                'step':                  self.step_count,
-                'phi_before':            log.phi_before,
-                'phi_after':             phi_after,
-                'state_before':          log.state_before,
-                'state_after':           state_after,
-                'vol_opt':               vol_opt,
-                'maturity':              maturity,
-                'hessian_updated':       hessian_updated,
-                'viable_action_count':   len(viable_actions),
-                'committed_action':      committed_action_type,
-                'committed_phi':         committed_phi,
-                'migration_triggered':   migration_triggered,
-                'migration_outcome':     migration_outcome,
-                'freeze_verified':       freeze_verified,
-                'attractor_status':      attractor_status,
-                'crk_violations':        [[v[0], v[1]] for v in violations_after],
-                'coupling_confidence':   self.coupling_estimator.get_confidence(),
-                'coupling_observations': self.coupling_estimator.observation_count,
-                'action_map_affordances': len(self.coupling_estimator.get_empirical_action_map()),
-                'discovered_axes':       len(self.ledger.discovered_structure),
-                'residual_explanation':  residual_explanation,
-                'operator_S':            log.operator_S,
-                'operator_I':            log.operator_I,
-                'operator_P':            log.operator_P,
-                'operator_P_grounded':   log.operator_P_grounded,
-                'operator_A':            log.operator_A,
-                'loop_closure':          log.loop_closure,
-                'signature_deviation':   log.signature_deviation,
-                's_i_consistency':       log.s_i_consistency,
-                'i_p_consistency':       log.i_p_consistency,
-                'p_a_consistency':       log.p_a_consistency,
-                'smo_consistency':       log.smo_consistency,
-                'active_channel_count':  log.active_channel_count,
-                'realized_horizon':      log.realized_horizon,
-                'crk_coherent':          log.crk_coherent,
-                'crk_repair':            log.crk_repair,
-                'crk_violations_new':    log.crk_violations_new,
-                'smo_plasticity':        log.smo_plasticity,
-                'smo_permitted':         log.smo_permitted,
-                'smo_withheld_layers':   log.smo_withheld_layers,
-                'smo_rollback':          log.smo_rollback,
-                'gradient_entropy':      log.gradient_entropy,
+                'event':                    'step_log',
+                'step':                     self.step_count,
+                'phi_before':               log.phi_before,
+                'phi_after':                phi_after,
+                'state_before':             log.state_before,
+                'state_after':              state_after,
+                'vol_opt':                  vol_opt,
+                'maturity':                 maturity,
+                'hessian_updated':          hessian_updated,
+                'viable_action_count':      len(viable_actions),
+                'committed_action':         committed_action_type,
+                'committed_phi':            committed_phi,
+                'pre_commit_iterations':    0,   # v16.2.1: loop removed
+                'migration_triggered':      migration_triggered,
+                'migration_outcome':        migration_outcome,
+                'crk_violations':           _post_violations,
+                'coupling_confidence':      self.coupling_estimator.get_confidence(),
+                'coupling_observations':    self.coupling_estimator.observation_count,
+                'action_map_affordances':   len(self.coupling_estimator.get_empirical_action_map()),
+                'discovered_axes':          len(self.ledger.discovered_structure),
+                'residual_explanation':     residual_explanation,
+                'operator_S':               log.operator_S,
+                'operator_I':               log.operator_I,
+                'operator_P':               log.operator_P,
+                'operator_P_grounded':      log.operator_P_grounded,
+                'operator_A':               log.operator_A,
+                'loop_closure':             log.loop_closure,
+                'signature_deviation':      log.signature_deviation,
+                's_i_consistency':          log.s_i_consistency,
+                'i_p_consistency':          log.i_p_consistency,
+                'p_a_consistency':          log.p_a_consistency,
+                'smo_consistency':          log.smo_consistency,
+                'active_channel_count':     log.active_channel_count,
+                'realized_horizon':         log.realized_horizon,
+                'crk_coherent':             log.crk_coherent,
+                'crk_repair':               log.crk_repair,
+                'crk_violations_new':       log.crk_violations_new,
+                'smo_plasticity':           log.smo_plasticity,
+                'smo_permitted':            log.smo_permitted,
+                'smo_withheld_layers':      log.smo_withheld_layers,
+                'smo_rollback':             log.smo_rollback,
+                'gradient_entropy':         log.gradient_entropy,
                 'gradient_active_channels': log.gradient_active_channels,
+            }, default=_json_default) + '\n')
+            # Human-readable step summary — separate event for easy grepping
+            self.log_file.write(json.dumps({
+                'event':        'step_summary',
+                'step':         self.step_count,
+                'url':          (affordances.get('current_url', '') or '')[-60:],
+                'committed':    committed_action_type,
+                'viable':       sorted(viable_actions),
+                'scores':       {k: round(v, 3) for k, v in scores.items()},
+                'eog':          {k: round(v, 4) for k, v in eog_dict.items()},
+                'vol_opt':      round(vol_opt, 4),
+                'maturity':     round(maturity, 6),
+                'phi':          round(phi_after, 4),
+                'c_local':      round(log.c_local, 4),
+                'c_global':     round(log.c_global, 4),
+                'loop_closure': round(log.loop_closure, 3),
+                'graph_edges':  len(self.state.compression.causal_graph),
+                'mean_conf':    round(float(np.mean([e.confidence for e in self.state.compression.causal_graph.values()])) if self.state.compression.causal_graph else 0.0, 4),
+                'active_ch':    self.state.sensing.domain_size(),
+                'crk_c2':       [e.signal for e in (post_verdict.evaluations if 'post_verdict' in locals() else []) if e.constraint == 'C2'],
+                'migration':    migration_triggered,
             }, default=_json_default) + '\n')
             self.log_file.flush()
 
@@ -1460,11 +1519,12 @@ class MentatTriad:
         """Main triad execution loop."""
         if verbose:
             print('='*70)
-            print('UII v16 — HESSIAN-GUIDED MENTAT TRIAD')
+            print('UII v16.2 — HESSIAN-GUIDED MENTAT TRIAD')
             print('DASS (S/I/P/A) + PhiField H + CRK + Ledger')
             print(f'Running for {max_steps} batch cycles')
             print(f'Step budget: {self.step_budget}')
-            print(f'Micro-perturbations per check: {self.micro_perturbations_per_check}')
+            print(f'Pre-commit max iterations: {PRE_COMMIT_MAX_ITERATIONS}  '
+                  f'SMO threshold: {SMO_CONVERGENCE_THRESHOLD}')
             print(f'Log: {self.log_path}')
             print('='*70)
 
@@ -1477,11 +1537,23 @@ class MentatTriad:
 
                 log = self.step(verbose=verbose)
 
-                if not verbose and self.step_count % 10 == 0:
-                    print(f'[{self.step_count}] Φ={log.phi_after:.3f}  '
-                          f'Vol_opt={log.vol_opt:.4f}  maturity={log.maturity:.3f}  '
-                          f'CoupConf={self.coupling_estimator.get_confidence():.2f}  '
-                          f'viable={log.viable_action_count}')
+                # Always print — one line per step so runs are debuggable
+                url_short = ((log.reality_context or {}).get('current_url', '') or '')[-45:]
+                mean_conf = float(np.mean(
+                    [e.confidence for e in self.state.compression.causal_graph.values()]
+                )) if self.state.compression.causal_graph else 0.0
+                print(
+                    f"[{self.step_count:3d}] "
+                    f"act={str(log.committed_action or 'none'):<10s} "
+                    f"Φ={log.phi_after:+7.3f}  "
+                    f"vol={log.vol_opt:>12.1f}  "
+                    f"mat={log.maturity:.2e}  "
+                    f"pci={log.pre_commit_iterations}  "
+                    f"viable={log.viable_action_count}  "
+                    f"edges={len(self.state.compression.causal_graph):4d}  "
+                    f"conf={mean_conf:.3f}  "
+                    f"url={url_short}"
+                )
 
         finally:
             self.fitness_metrics['survival_time'] = self.step_count
@@ -1516,7 +1588,6 @@ class MentatTriad:
                 'llm_calls':                self.llm_calls,
                 'total_micro_perturbations': self.total_micro_perturbations,
                 'fitness':                  self.fitness_metrics,
-                'freeze_verified':          self.attractor_monitor.freeze_verified,
                 'final_state':              self.state.as_dict(),
                 'final_vol_opt':            self.peak_tracker.peak_vol_opt,
                 'peak_step':                self.peak_tracker.peak_step,
@@ -1544,7 +1615,6 @@ class MentatTriad:
                 print(f'{"="*70}')
                 print(f'Peak Vol_opt: {self.peak_tracker.peak_vol_opt:.4f} '
                       f'(step {self.peak_tracker.peak_step})')
-                print(f'Freeze verified: {self.attractor_monitor.freeze_verified}')
                 print(f'Coupling confidence: {self.coupling_estimator.get_confidence():.2f} '
                       f'({self.coupling_estimator.observation_count} obs)')
                 print(f'Action map: {len(self.coupling_estimator.get_empirical_action_map())} affordances')
@@ -1603,7 +1673,7 @@ if __name__ == '__main__':
     max_steps   = int(sys.argv[1]) if len(sys.argv) > 1 and sys.argv[1].isdigit() else 100
     verbose     = '--verbose' in sys.argv or '-v' in sys.argv
     ledger_path = None
-    step_budget = 100
+    step_budget = 50    
 
     if '--load-ledger' in sys.argv:
         idx = sys.argv.index('--load-ledger')
@@ -1624,12 +1694,11 @@ if __name__ == '__main__':
     reality = BrowserRealityAdapter(base_delta=0.03, headless=True)
 
     triad = MentatTriad(
-        intelligence                  = intelligence,
-        reality                       = reality,
-        micro_perturbations_per_check = 10,
-        step_budget                   = step_budget,
-        ledger                        = ledger,
-        log_mode                      = 'full' if verbose else 'minimal',
+        intelligence = intelligence,
+        reality      = reality,
+        step_budget  = step_budget,
+        ledger       = ledger,
+        log_mode     = 'full' if verbose else 'minimal',
     )
 
     metrics = triad.run(max_steps=max_steps, verbose=verbose)

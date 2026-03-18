@@ -321,38 +321,6 @@ class CompressionOperator:
             observation_count = new_obs,
         )
 
-    def absorb_prediction_error(self, error_dict: Dict[str, float]) -> 'CompressionOperator':
-        """
-        P→I feedback: decay confidence of edges involving high-error channels.
-        Called by PredictionOperator.observe_outcome() caller.
-        Returns new CompressionOperator — does not mutate.
-        """
-        new_graph = {}
-        new_errors = deque(self.prediction_errors, maxlen=self.prediction_errors.maxlen)
-        new_errors.append(np.mean(list(error_dict.values())) if error_dict else 0.0)
-
-        for key, edge in self.causal_graph.items():
-            src, tgt   = key
-            src_error  = error_dict.get(src, 0.0)
-            tgt_error  = error_dict.get(tgt, 0.0)
-            edge_error = max(src_error, tgt_error)
-
-            if edge_error > 0.1:
-                # High prediction error → decay confidence for edges in these channels
-                decay       = 1.0 - min(0.3, edge_error)
-                new_conf    = max(0.0, edge.confidence * decay)
-                new_graph[key] = dataclasses.replace(edge, confidence=new_conf)
-            else:
-                new_graph[key] = edge
-
-        return CompressionOperator(
-            causal_graph      = new_graph,
-            pattern_library   = dict(self.pattern_library),
-            residual_variance = dict(self.residual_variance),
-            prediction_errors = new_errors,
-            observation_count = self.observation_count,
-        )
-
     def to_scalar_proxy(self) -> float:
         if not self.causal_graph:
             return 0.0
@@ -477,7 +445,9 @@ class PredictionOperator:
         Compare predictions against actual SensingOperator.
         Update per-channel horizon: +1 when error < NOISE_FLOOR, -1 when above.
         Returns (updated_PredictionOperator, error_dict).
-        error_dict caller must pass to compression.absorb_prediction_error().
+        error_dict is used by SMO (plasticity adaptation) and CoherenceOperator (p_a).
+        P errors do not feed back to CompressionOperator — I creates C from S;
+        whether P can predict from C is P's problem, not evidence that C is wrong.
         """
         error_dict:   Dict[str, float] = {}
         new_preds     = dict(self.channel_predictions)
@@ -529,36 +499,30 @@ class PredictionOperator:
         return updated, error_dict
 
     def test_virtual(self,
-                     compression:       'CompressionOperator',
-                     candidate_action:  str,
+                     compression:        'CompressionOperator',
+                     candidate_action:   str,
                      phi_field,
-                     sensing:           'SensingOperator') -> Dict[str, float]:
+                     sensing:            'SensingOperator',
+                     coupling_estimator  = None) -> Dict[str, float]:
         """
         Project action forward through channel space and causal graph.
         Returns a channel-keyed delta dict suitable for ⟨delta, ∇Φ⟩ scoring.
         Nothing written to actual state — reversibility is structural.
 
-        Two stages:
-          1. Primary: direct channel influence of the action.
-             All 13 affordances covered. Inactive channels included —
-             an action that can activate network_http is a real causal
-             relationship the gradient should be able to point toward.
+        v16.2.1: Primary channel influence now uses empirical data from
+        coupling_estimator when available (≥5 observations for this action).
+        Falls back to the hardcoded PRIMARY table during bootstrap.
 
+        Empirical→channel mapping:
+          coupling_estimator.affordance_deltas holds SIPA-space deltas.
+          CHANNEL_TO_DIM maps channel_id → SIPA dim.
+          Inverse: distribute each SIPA delta across its channels,
+          weighted by current channel coverage.
+
+        Two stages (unchanged):
+          1. Primary: direct channel influence (empirical or prior).
           2. Secondary: propagate through causal graph.
-             If action pushes channel src by magnitude m, and the graph
-             has edge (src → tgt) with weight w and confidence c, then
-             tgt receives an additional m * w * c contribution.
-             This makes prediction a function of actual operator geometry,
-             not a static lookup table.
-
-        query_agent: empty — no channel signature until the agent interface
-        is properly wired. Scores 0 in gradient alignment; won't be selected
-        unless all other actions also score 0.
         """
-        # Primary channel influence — direct effect of each action.
-        # Inactive channels are included (action can open them).
-        # Magnitudes are coverage deltas: how much this action expands
-        # the system's sensing surface on each channel.
         PRIMARY: Dict[str, Dict[str, float]] = {
             'navigate':    {'browser': 0.1, 'network_http': 0.05, 'network_dns': 0.02},
             'click':       {'browser': 0.05},
@@ -574,15 +538,45 @@ class PredictionOperator:
             'migrate':     {'ssh_remote': 0.3, 'process_self': 0.1,
                             'network_socket': 0.05},
             'llm_query':   {'api_llm': 0.1, 'network_http': 0.03},
-            'query_agent': {},   # placeholder — no channel signature yet
+            'query_agent': {},
         }
-        primary = PRIMARY.get(candidate_action, {})
 
-        # Start with primary delta
+        primary: Dict[str, float] = {}
+
+        if (coupling_estimator is not None
+                and len(coupling_estimator.affordance_deltas.get(
+                    candidate_action, [])) >= 5):
+
+            obs       = coupling_estimator.affordance_deltas[candidate_action]
+            dims      = ['S', 'I', 'P', 'A']
+            mean_sipa = {
+                d: float(np.mean([o.get(d, 0.0) for o in obs]))
+                for d in dims
+            }
+
+            dim_to_channels: Dict[str, List[str]] = {}
+            for cid, dim in CHANNEL_TO_DIM.items():
+                dim_to_channels.setdefault(dim, []).append(cid)
+
+            channels = sensing.channels
+            for dim, sipa_delta in mean_sipa.items():
+                if abs(sipa_delta) < 1e-8:
+                    continue
+                ch_ids    = dim_to_channels.get(dim, [])
+                coverages = {cid: channels[cid].coverage
+                             for cid in ch_ids if cid in channels}
+                total_cov = sum(coverages.values())
+                if total_cov < 1e-8:
+                    for cid in ch_ids:
+                        if cid in channels:
+                            primary[cid] = primary.get(cid, 0.0) + sipa_delta / max(len(ch_ids), 1)
+                else:
+                    for cid, cov in coverages.items():
+                        primary[cid] = primary.get(cid, 0.0) + sipa_delta * (cov / total_cov)
+        else:
+            primary = dict(PRIMARY.get(candidate_action, {}))
+
         delta: Dict[str, float] = dict(primary)
-
-        # Secondary: propagate primary through causal graph.
-        # For each primary-affected channel, follow outgoing edges.
         for src, magnitude in primary.items():
             for (edge_src, edge_tgt), edge in compression.causal_graph.items():
                 if edge_src == src:
@@ -598,53 +592,43 @@ class PredictionOperator:
                            sensing:     SensingOperator,
                            compression: CompressionOperator) -> float:
         """
-        P: viable future volume from prediction covariance geometry.
+        P: C → C' quality. Measures forward model accuracy and horizon.
 
-        O(x) = Σ_{λ_i > 0} λ_i  of  Σ_P
+        From the invariant: ∃ operator P: C → C' such that predicted ΔC
+        remains bounded and reversible.
 
-        Σ_P is built over active sensing channels:
-          Diagonal:     Σ_P[i,i] = coverage_i
-            Self-prediction variance — how much of channel i's domain is
-            currently reachable. Non-zero during bootstrap (no causal graph
-            required), so P > 0 as soon as any channel has coverage > 0.
+        Bounded ΔC   → prediction_accuracy: per-channel EMA of (1 - error).
+                        How closely predicted deltas match observed ones.
+                        Computed by observe_outcome() every step.
 
-          Off-diagonal: Σ_P[i,j] = weight(i→j) × conf(i→j) × coverage_i
-            Causal co-prediction weighted by source coverage.
+        Reversibility → realized_horizon: mean steps ahead where predictions
+                        stay below NOISE_FLOOR without compounding error.
+                        Computed by observe_outcome() every step.
 
-        Result is normalized by n (number of active channels), which is the
-        maximum possible O when all eigenvalues equal 1.0.
+        P = mean_accuracy × (0.5 + 0.5 × horizon_norm)
+          Both factors required for high P:
+            accurate over short horizon  = moderate P (can predict one step)
+            accurate over long horizon   = high P     (bounded multi-step)
+          This matches the invariant: bounded AND reversible.
 
-        This replaces the old √(S×I) grounding cap, which was scalar proxy
-        era logic with no geometric basis in the UII math.
+        P starts at 0 at bootstrap — a fresh system with no causal history
+        has no prediction quality. P is earned through observe_outcome().
+
+        Previous implementation (v16.0-v16.2.1) computed sensing-surface
+        volume from Σ_P eigenvalues — S-space, not C-space. That made P
+        track S directly, violating the S→I→P→A independence requirement.
         """
-        channels = sensing.channels
-        active = [cid for cid, ch in channels.items() if ch.active]
-        n = len(active)
-        if n == 0:
-            return 0.0
+        active_acc = [
+            acc for cid, acc in self.prediction_accuracy.items()
+            if sensing.channels.get(cid) and sensing.channels[cid].active
+        ]
+        if not active_acc:
+            return 0.0   # bootstrap: no predictions made yet
 
-        idx = {cid: i for i, cid in enumerate(active)}
-        sigma_p = np.zeros((n, n))
+        mean_accuracy = float(np.mean(active_acc))
+        horizon_norm  = float(np.clip(self.realized_horizon / 50.0, 0.0, 1.0))
 
-        # Coverage diagonal: self-prediction variance per active channel
-        for i, cid in enumerate(active):
-            sigma_p[i, i] = channels[cid].coverage
-
-        # Off-diagonal: causal co-prediction weighted by source coverage
-        for (src, tgt), edge in compression.causal_graph.items():
-            if src in idx and tgt in idx:
-                sigma_p[idx[src], idx[tgt]] += (
-                    edge.weight * edge.confidence * channels[src].coverage
-                )
-
-        # Symmetrize — prediction covariance is symmetric
-        sigma_p = (sigma_p + sigma_p.T) / 2.0
-
-        eigenvalues = np.linalg.eigvalsh(sigma_p)
-        viable_vol = float(np.sum(eigenvalues[eigenvalues > 0]))
-
-        # Normalize by n: max O when all eigenvalues = 1.0
-        return float(np.clip(viable_vol / max(n, 1), 0.0, 1.0))
+        return float(np.clip(mean_accuracy * (0.5 + 0.5 * horizon_norm), 0.0, 1.0))
 
     # ── v16 additions ─────────────────────────────────────────────────────────
 

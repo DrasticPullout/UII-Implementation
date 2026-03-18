@@ -320,6 +320,63 @@ class StateTrace:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# GroundingSpec — v16.1
+# ──────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class GroundingSpec:
+    """
+    Geometric context passed from the Triad to SymbolGroundingAdapter.ground_symbol().
+
+    Built once per step from Phase 2 output. Carries the field's intent —
+    what channels it needs signal on and in what direction — so the LLM
+    receives a precise spec rather than an open-ended prompt.
+
+    The Triad reasons. The LLM fills in the blank.
+
+    Fields
+    ------
+    desired_delta         : channel_id → natural gradient component.
+                            Positive = field wants this channel to grow.
+                            Derived from H⁻¹ ∇Φ in active channel space.
+    dark_channels         : channels with coverage < 0.3 AND gradient above
+                            median. What the field most wants to sense but can't.
+    top_gradient_channels : top-5 channels by |∇Φ| regardless of coverage.
+                            Used when dark_channels is empty.
+    current_url           : browser URL at grounding time.
+    page_title            : page title at grounding time.
+    nat_grad_magnitude    : ‖H⁻¹ ∇Φ‖ — overall field drive strength.
+    """
+    desired_delta:          Dict[str, float]
+    dark_channels:          List[str]
+    top_gradient_channels:  List[str]
+    current_url:            str
+    page_title:             str
+    nat_grad_magnitude:     float = 0.0
+
+    def sensing_target_summary(self, max_channels: int = 5) -> str:
+        """Token-minimal summary for LLM prompts."""
+        targets = self.dark_channels[:max_channels] or self.top_gradient_channels[:max_channels]
+        if not targets:
+            return "no specific channel targets"
+        parts = []
+        for cid in targets:
+            delta = self.desired_delta.get(cid, 0.0)
+            direction = "↑" if delta > 0 else "↓"
+            parts.append(f"{cid}{direction}")
+        return ", ".join(parts)
+
+    def desired_delta_summary(self, max_channels: int = 5) -> str:
+        """Top desired deltas for LLM prompts. Token-minimal."""
+        sorted_by_magnitude = sorted(
+            self.desired_delta.items(),
+            key=lambda kv: abs(kv[1]),
+            reverse=True
+        )[:max_channels]
+        return ", ".join(f"{cid}={v:+.3f}" for cid, v in sorted_by_magnitude)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Module-level geometry functions
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -341,36 +398,54 @@ def eigen_decompose(H: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     eigvals = np.clip(eigvals, -1e6, 1e6)
     return eigvals, eigvecs
 
-
-def expected_optionality_gain(prediction:  PredictionOperator,
-                               action:      str,
-                               compression: CompressionOperator,
-                               sensing:     SensingOperator) -> float:
+def expected_optionality_gain(prediction:         PredictionOperator,
+                               action:             str,
+                               compression:        CompressionOperator,
+                               sensing:            SensingOperator,
+                               coupling_estimator  = None) -> float:
     """
-    E[Δlog(O(a))] = log(vol_opt_post) - log(vol_opt_pre)
+    E[Δlog(O(a))] = log_vol(Σ_P_post) - log_vol(Σ_P_pre)
 
-    vol_opt = sum of positive eigenvalues of Σ_P.
-    pre:  current covariance_matrix().
-    post: simulate_covariance_update(action, compression, sensing).
+    v16.2.1: coupling_estimator passed through to test_virtual so virtual
+    delta uses empirical observations rather than hardcoded PRIMARY table.
 
-    Returns 0.0 if either covariance matrix has no positive eigenvalues.
-
-    Called once per step for all actions before _build_viable_set().
-    Result is shared between C2 collapse detection and score_actions().
-    Never recomputed inside either.
+    Called once per step for all actions before viable set construction.
+    Result shared between C2 and score_actions(). Never recomputed inside either.
     """
-    sigma_pre,  _ = prediction.covariance_matrix(sensing, compression)
-    sigma_post, _ = prediction.simulate_covariance_update(action, compression, sensing)
+    sigma_pre, active = prediction.covariance_matrix(sensing, compression)
+
+    if sigma_pre.shape[0] == 0:
+        return 0.0
+
+    delta = prediction.test_virtual(
+        compression, action, phi_field=None, sensing=sensing,
+        coupling_estimator=coupling_estimator,
+    )
+
+    channels = sensing.channels
+    idx      = {cid: i for i, cid in enumerate(active)}
+    n        = len(active)
+
+    hyp_coverage = {
+        cid: float(np.clip(channels[cid].coverage + delta.get(cid, 0.0), 0.0, 1.0))
+        for cid in active
+    }
+
+    sigma_post = np.zeros((n, n))
+    for i, cid in enumerate(active):
+        sigma_post[i, i] = hyp_coverage[cid]
+    for (src, tgt), edge in compression.causal_graph.items():
+        if src in idx and tgt in idx:
+            sigma_post[idx[src], idx[tgt]] += (
+                edge.weight * edge.confidence * hyp_coverage[src]
+            )
+    sigma_post = (sigma_post + sigma_post.T) / 2.0
 
     def _log_vol(sigma: np.ndarray) -> float:
-        if sigma.shape[0] == 0:
-            return 0.0
         ev = np.linalg.eigvalsh(sigma)
-        pos = ev[ev > 1e-9]
-        return float(np.sum(np.log(pos))) if len(pos) > 0 else 0.0
+        return float(np.sum(np.log(np.clip(ev, 1e-9, None))))
 
     return _log_vol(sigma_post) - _log_vol(sigma_pre)
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # PhiField — v16
@@ -778,6 +853,7 @@ class PhiField:
                 ev, evec = np.linalg.eigh(sigma_p)
             pos = ev > 1e-9
             if np.any(pos):
+                inv_ev = np.minimum(1.0 / ev[pos], 1e3)
                 H_O = evec[:, pos] @ np.diag(1.0 / ev[pos]) @ evec[:, pos].T
             else:
                 H_O = np.zeros((n, n))
@@ -807,17 +883,18 @@ class PhiField:
     # ── score_actions — NEW in v16 ────────────────────────────────────────────
 
     def score_actions(self,
-                      viable_actions:       List[str],
+                      viable_actions:        List[str],
                       state,
-                      H:                    np.ndarray,
-                      eigvals:              np.ndarray,
-                      eigvecs:              np.ndarray,
-                      active_channels:      List[str],
-                      H_C:                  np.ndarray,
-                      H_O:                  np.ndarray,
-                      prediction:           PredictionOperator,
-                      peak_snapshot:        Optional[Dict] = None,
+                      H:                     np.ndarray,
+                      eigvals:               np.ndarray,
+                      eigvecs:               np.ndarray,
+                      active_channels:       List[str],
+                      H_C:                   np.ndarray,
+                      H_O:                   np.ndarray,
+                      prediction:            PredictionOperator,
+                      peak_snapshot:         Optional[Dict] = None,
                       optionality_gain_dict: Optional[Dict[str, float]] = None,
+                      coupling_estimator     = None,
                       ) -> Dict[str, float]:
         """
         score(a) = maturity × nat_grad_align_norm(a) + (1 - maturity) × E[Δlog(O(a))]
@@ -883,7 +960,8 @@ class PhiField:
         for action in viable_actions:
             # Action direction in active channel space
             channel_delta = state.prediction.test_virtual(
-                state.compression, action, phi_field=None, sensing=state.sensing
+                state.compression, action, phi_field=None, sensing=state.sensing,
+                coupling_estimator=coupling_estimator,
             )
             dx = np.zeros(n)
             for cid, val in channel_delta.items():
@@ -897,7 +975,8 @@ class PhiField:
                 optionality_gain[action] = optionality_gain_dict[action]
             else:
                 optionality_gain[action] = expected_optionality_gain(
-                    prediction, action, state.compression, state.sensing
+                    prediction, action, state.compression, state.sensing,
+                    coupling_estimator=coupling_estimator,
                 )
 
         # ── Normalize nat_grad_align to [0, 1] ───────────────────────────────
@@ -954,15 +1033,26 @@ class CRKVerdict:
 
 class CRKMonitor:
     """
-    Constraint Recognition Kernel (CRK) — unchanged from v15.3.
+    Constraint Recognition Kernel (CRK) — v16 geometric gating.
 
-    Pre-action:  filters action manifold; returns phi_modifier.
+    Pre-action:  filters action manifold via field geometry; returns phi_modifier.
     Post-action: gates SMO update; failed → rollback signal.
+
+    C1 and C2 pre-action no longer use static action type lists.
+    All actions are evaluated geometrically via E[Δlog(O(a))].
+    Reversibility is a property of outcome, not type — the Hessian answers it.
     """
 
-    PREDICTION_ERROR_THRESHOLD = 0.05
-    IRREVERSIBLE_ACTIONS = {'migrate', 'navigate', 'python'}
-    COMMITTING_ACTIONS   = {'migrate', 'navigate', 'python', 'click', 'fill', 'type'}
+    PREDICTION_ERROR_THRESHOLD = 0.05   # retained for any legacy references
+
+    # C3: accurate causal attribution
+    C3_A_DROP_THRESHOLD    = 0.05   # coherence drop that warrants checking attribution
+    C3_S_STABLE_THRESHOLD  = 0.03   # |ΔS| below this → environment wasn't the cause
+    C3_P_ERROR_THRESHOLD   = 0.10   # prediction error above this → internal model failed
+
+    # C4: overconfidence without reality contact
+    C4_OVERCONFIDENCE_THRESHOLD = 0.5
+    C4_SIGNAL_THRESHOLD         = 0.05
 
     def evaluate_pre_action(self,
                              proposed_action: str,
@@ -976,12 +1066,38 @@ class CRKMonitor:
         loop_cl   = crk_sig['loop_closure']
         sig_dev   = crk_sig['signature_deviation']
         i_p       = crk_sig['i_p_consistency']
-        p_proxy   = prediction.to_grounded_proxy(sensing, compression)
         evaluations: List[CRKEvaluation] = []
 
-        # C1
-        irreversible     = proposed_action in self.IRREVERSIBLE_ACTIONS
-        c1_blocks        = loop_cl < 0.3 and irreversible and sig_dev > 0.3
+        # Pre-compute E[Δlog(O)] once — used by both C1 and C2.
+        # forming: Hessian not yet reliable — eog computation degrades gracefully
+        # but block decisions during forming are permissive to allow bootstrap.
+        if compression.causal_graph:
+            mean_conf = float(np.mean([e.confidence
+                                       for e in compression.causal_graph.values()]))
+        else:
+            mean_conf = 0.0
+        forming = mean_conf < 0.1
+
+        eog = 0.0
+        if not forming:
+            try:
+                eog = expected_optionality_gain(
+                    prediction, proposed_action, compression, sensing
+                )
+            except Exception:
+                eog = 0.0
+
+        # ── C1: Continuity ────────────────────────────────────────────────────
+        # Block when the action threatens the manifold and the loop is already
+        # fragile. Geometric criterion: significant eigenvolume collapse combined
+        # with low loop closure. No static action type list — the geometry answers
+        # whether this action is safe to take given current coherence.
+        #
+        # Thresholds:
+        #   eog < -0.1  : meaningful collapse, not noise
+        #   loop_cl < 0.3 : loop already fragile — cannot absorb further loss
+        #
+        # During forming: C1 is permissive (eog unreliable, bootstrap must explore).
         c1_stability_risk = 0.0
         try:
             coupling   = compression.to_coupling_matrix()
@@ -991,6 +1107,12 @@ class CRKMonitor:
             c1_stability_risk = float(np.clip(-stability, 0.0, 1.0)) if stability < -0.1 else 0.0
         except Exception:
             pass
+
+        if forming:
+            c1_blocks = False
+        else:
+            c1_blocks = (eog < -0.1) and (loop_cl < 0.3)
+
         base_c1_risk = float(np.clip(1.0 - loop_cl + sig_dev + c1_stability_risk * 0.3, 0.0, 1.0))
         evaluations.append(CRKEvaluation(
             constraint  = 'C1',
@@ -1000,27 +1122,35 @@ class CRKMonitor:
             attribution = 'internal',
             blocks      = c1_blocks,
             signal      = (f'loop_closure={loop_cl:.2f}, sig_dev={sig_dev:.2f}, '
-                           f'irreversible={irreversible}, stability_risk={c1_stability_risk:.3f}'),
+                           f'eog={eog:.4f}, stability_risk={c1_stability_risk:.3f}'),
         ))
 
-        # C2
-        committing = proposed_action in self.COMMITTING_ACTIONS
-        forming    = len(compression.causal_graph) == 0
-        c2_blocks  = p_proxy < 0.15 and committing and not forming
+        # ── C2: Optionality ───────────────────────────────────────────────────
+        # Every action is evaluated geometrically. During forming the Hessian is
+        # not yet reliable so C2 is permissive. After forming: block any action
+        # that strictly collapses positive eigenvolume (eog < -0.01 with margin).
+        # No static committing/non-committing distinction — the geometry applies
+        # to all actions equally.
+        if forming:
+            c2_blocks = False
+        else:
+            c2_blocks = eog < -0.01
+
         evaluations.append(CRKEvaluation(
             constraint  = 'C2',
             phase       = 'pre_action',
             status      = 'satisfied' if forming else (
                           'violated' if c2_blocks else (
-                          'degraded' if p_proxy < 0.3 else 'satisfied')),
-            risk        = 0.0 if forming else (
-                          float(np.clip(0.3 - p_proxy, 0.0, 1.0)) if p_proxy < 0.3 else 0.0),
+                          'degraded' if eog < 0.0 else 'satisfied')),
+            risk        = 0.0 if forming else float(np.clip(-eog, 0.0, 1.0)),
             attribution = 'internal',
             blocks      = c2_blocks,
-            signal      = f'p_proxy={p_proxy:.2f}, committing={committing}, forming={forming}',
+            signal      = (f'forming=True mean_conf={mean_conf:.3f}'
+                           if forming else
+                           f'eog={eog:.4f}'),
         ))
 
-        # C3
+        # ── C3: Non-Internalization ───────────────────────────────────────────
         c3_blocks = i_p < 0.3
         evaluations.append(CRKEvaluation(
             constraint  = 'C3',
@@ -1032,7 +1162,7 @@ class CRKMonitor:
             signal      = f'i_p_consistency={i_p:.2f}',
         ))
 
-        # C6
+        # ── C6: Agenthood / resource ──────────────────────────────────────────
         system_load = field_state.get('system_load', 0.0)
         evaluations.append(CRKEvaluation(
             constraint  = 'C6',
@@ -1044,7 +1174,11 @@ class CRKMonitor:
             signal      = f'system_load={system_load:.2f}',
         ))
 
-        # C7
+        # ── C7: Coherence — migrate gate ──────────────────────────────────────
+        # migrate is the one action where type identity matters architecturally:
+        # it exits the current M entirely to find a substrate where M can be
+        # re-established. Requiring loop_cl >= 0.5 before migrate ensures the
+        # current loop is coherent enough to serialize and transfer.
         phi_trend = field_state.get('phi_trend', 0.0)
         c7_blocks = proposed_action == 'migrate' and loop_cl < 0.5
         evaluations.append(CRKEvaluation(
@@ -1109,7 +1243,8 @@ class CRKMonitor:
         evaluations.append(self._c4_post(observed_delta, predicted_delta, sensing, compression))
         evaluations.append(self._c5_post(observed_delta, predicted_delta, coherence))
         evaluations.append(self._c1_post(proposed_smo_update, prior_compression, compression))
-        evaluations.append(self._c3_post(proposed_smo_update, smo_plasticity))
+        evaluations.append(self._c3_post(observed_delta, predicted_delta,
+                                          proposed_smo_update, coherence))
 
         smo_permitted = not any(e.blocks for e in evaluations)
         repair = None
@@ -1140,58 +1275,116 @@ class CRKMonitor:
             smo_permitted = smo_permitted,
         )
 
-    def _c3_post(self, prediction_errors: Dict, smo_plasticity: float) -> CRKEvaluation:
+    def _c3_post(self,
+                 observed_delta:    Dict,
+                 predicted_delta:   Dict,
+                 prediction_errors: Dict,
+                 coherence:         CoherenceOperator) -> CRKEvaluation:
+        """
+        C3: Non-Internalization — accurate causal attribution.
+
+        Failure should be learned from. The violation is misattribution:
+        the system blaming itself for an externally-caused failure, or
+        collapsing internal coherence (A) when the cause was an internal
+        model error that P should simply learn from.
+
+        Violation condition — all three must hold:
+          1. A dropped significantly       → coherence is falling
+          2. S was stable (|ΔS| small)     → environment wasn't the cause
+          3. Prediction error was large    → internal model failed
+
+        This means: A fell because P was wrong about a stable environment.
+        That's the self-blame loop — the correct response is for P to update
+        its accuracy, not for A to collapse.
+
+        If A dropped because S moved violently: external cause, correct behavior.
+        If A dropped and prediction errors were small: something else, not C3.
+        If A is stable: no attribution problem regardless of errors.
+
+        Blocks: False — C3 does not block SMO. It flags for reattribute repair,
+        which caps plasticity to prevent compounding adaptation in wrong direction.
+        """
+        # A drop: how much did coherence fall this step?
+        delta_A  = float(observed_delta.get('A', 0.0))
+        a_dropped = delta_A < -self.C3_A_DROP_THRESHOLD
+
+        if not a_dropped:
+            return CRKEvaluation('C3', 'post_action', 'satisfied', 0.0, 'external', False,
+                                 f'ΔA={delta_A:+.3f} — coherence stable, no attribution check needed')
+
+        # Was the environment stable? (|ΔS| small → not externally driven)
+        delta_S   = abs(float(observed_delta.get('S', 0.0)))
+        env_moved = delta_S > self.C3_S_STABLE_THRESHOLD
+
+        if env_moved:
+            return CRKEvaluation('C3', 'post_action', 'satisfied', abs(delta_A), 'external', False,
+                                 f'ΔA={delta_A:+.3f}, ΔS={delta_S:.3f} — '
+                                 f'environment caused the drop, attribution correct')
+
+        # Was it an internal model failure?
         mean_error = (float(np.mean(list(prediction_errors.values())))
                       if prediction_errors else 0.0)
-        if mean_error > 0.15 and smo_plasticity > 0.75:
-            return CRKEvaluation('C3', 'post_action', 'violated', smo_plasticity,
+        model_failed = mean_error > self.C3_P_ERROR_THRESHOLD
+
+        if model_failed:
+            severity = abs(delta_A)
+            return CRKEvaluation('C3', 'post_action', 'violated', severity,
                                  'internal', False,
-                                 f'mean_error={mean_error:.3f} (external), '
-                                 f'plasticity={smo_plasticity:.2f} — internalising external resistance')
-        if mean_error > 0.10 and smo_plasticity > 0.65:
-            return CRKEvaluation('C3', 'post_action', 'degraded', smo_plasticity * 0.5,
-                                 'internal', False,
-                                 f'mean_error={mean_error:.3f}, plasticity={smo_plasticity:.2f} — watch')
-        return CRKEvaluation('C3', 'post_action', 'satisfied', 0.0, 'internal', False,
-                             f'mean_error={mean_error:.3f}, plasticity={smo_plasticity:.2f}')
+                                 f'ΔA={delta_A:+.3f}, ΔS={delta_S:.3f}, '
+                                 f'P_error={mean_error:.3f} — '
+                                 f'coherence collapsed on internal model failure; '
+                                 f'P should learn, A should recover')
+
+        return CRKEvaluation('C3', 'post_action', 'satisfied', abs(delta_A), 'mixed', False,
+                             f'ΔA={delta_A:+.3f}, ΔS={delta_S:.3f}, '
+                             f'P_error={mean_error:.3f} — cause ambiguous, monitoring')
 
     def _c4_post(self, observed: Dict, predicted: Dict,
                  sensing: SensingOperator,
                  compression: CompressionOperator) -> CRKEvaluation:
+        """
+        C4: Reality Constraint — model field as independent, uncertain.
+
+        Violation = deterministic overconfidence without reality contact.
+        High P-horizon confidence while sensing signal is weak = the closed
+        door: predicting without checking what's actually there.
+
+        Fires when:
+          realized_horizon is high (P thinks it can predict far ahead)
+          AND mean signal_rate across active channels is low (S not getting
+          fresh signal from reality to ground those predictions).
+
+        Zero realized_horizon = bootstrap, no violation possible.
+        """
         if len(compression.causal_graph) == 0:
             return CRKEvaluation('C4', 'post_action', 'satisfied', 0.0, 'external', False,
-                                 'forming — no model yet, all signal is external mismatch')
-        per_channel_error: Dict[str, float] = {}
-        for channel_id, ch in sensing.channels.items():
-            if not ch.active:
-                continue
-            obs  = observed.get(channel_id, None)
-            pred = predicted.get(channel_id, None)
-            if obs is None and pred is None:
-                continue
-            obs  = obs  if obs  is not None else 0.0
-            pred = pred if pred is not None else 0.0
-            if isinstance(obs,  dict): obs  = obs.get('magnitude',  0.0)
-            if isinstance(pred, dict): pred = pred.get('magnitude', 0.0)
-            per_channel_error[channel_id] = abs(float(obs) - float(pred))
-        if not per_channel_error:
-            for dim in ['S', 'I', 'P', 'A']:
-                ov = observed.get(dim, 0.0)
-                pv = predicted.get(dim, 0.0)
-                if isinstance(ov, (int, float)) and isinstance(pv, (int, float)):
-                    per_channel_error[dim] = abs(float(ov) - float(pv))
-        if not per_channel_error:
+                                 'forming — no model yet')
+
+        realized_horizon = int(observed.get('_realized_horizon', 0))
+        horizon_norm     = float(np.clip(realized_horizon / 50.0, 0.0, 1.0))
+
+        if horizon_norm < 1e-6:
+            return CRKEvaluation('C4', 'post_action', 'satisfied', 0.0, 'external', False,
+                                 'horizon=0 — bootstrap, no overconfidence possible')
+
+        active_channels = [ch for ch in sensing.channels.values() if ch.active]
+        if not active_channels:
             return CRKEvaluation('C4', 'post_action', 'satisfied', 0.0, 'external', False,
                                  'no active channels')
-        mean_error = float(np.mean(list(per_channel_error.values())))
-        if mean_error < self.PREDICTION_ERROR_THRESHOLD:
+
+        mean_signal    = float(np.mean([ch.signal_rate for ch in active_channels]))
+        signal_norm    = float(np.clip(mean_signal / self.C4_SIGNAL_THRESHOLD, 0.0, 1.0))
+        overconfidence = horizon_norm * (1.0 - signal_norm)
+
+        if overconfidence > self.C4_OVERCONFIDENCE_THRESHOLD:
             return CRKEvaluation('C4', 'post_action', 'violated',
-                                 1.0 - mean_error / self.PREDICTION_ERROR_THRESHOLD,
-                                 'internal', True,
-                                 f'mean_error={mean_error:.4f} < ε={self.PREDICTION_ERROR_THRESHOLD}'
-                                 f' — adaptation not grounded in external mismatch')
-        return CRKEvaluation('C4', 'post_action', 'satisfied', mean_error, 'external', False,
-                             f'mean_error={mean_error:.4f} — external mismatch confirmed')
+                                 overconfidence, 'internal', False,
+                                 f'horizon={realized_horizon} steps, '
+                                 f'signal_rate={mean_signal:.4f} — '
+                                 f'predicting without opening the door')
+
+        return CRKEvaluation('C4', 'post_action', 'satisfied', overconfidence, 'external', False,
+                             f'horizon={realized_horizon}, signal={mean_signal:.4f} — grounded')
 
     def _c1_post(self, proposed_update: Dict,
                  prior_compression: CompressionOperator,
@@ -1229,51 +1422,6 @@ class CRKMonitor:
                                  f'Reattribute before SMO update.')
         return CRKEvaluation('C5', 'post_action', 'satisfied', 0.0, 'external', False,
                              'attribution clear')
-
-    def evaluate(self, state, trace: StateTrace,
-                 reality_delta: Optional[Dict] = None) -> List[Tuple[str, float]]:
-        """Legacy scalar CRK — retained for backward compat and parallel validation."""
-        violations = []
-        if len(trace) >= 2:
-            recent = trace.get_recent(2)
-            prev   = recent[-2]
-            jump   = sum(abs(prev[k] - getattr(state, k)) for k in ["S", "I", "P", "A"])
-            if jump > 0.3:
-                violations.append(("C1_Continuity", jump - 0.3))
-        if state.P < 0.35:
-            violations.append(("C2_Optionality", 0.35 - state.P))
-        if len(trace) >= 5:
-            recent_5       = trace.get_recent(5)
-            conf_values    = [r["S"] + r["I"] for r in recent_5]
-            conf_declining = all(conf_values[i] >= conf_values[i + 1]
-                                  for i in range(len(conf_values) - 1))
-            externally_driven = (
-                reality_delta is not None and
-                sum(abs(v) for v in reality_delta.values()
-                    if isinstance(v, (int, float))) > 0.05
-            )
-            if conf_declining and not externally_driven:
-                severity = conf_values[0] - conf_values[-1]
-                if severity > 0.1:
-                    violations.append(("C3_NonInternalization", severity))
-        if reality_delta and len(trace) >= 3:
-            fb = sum(abs(v) for v in reality_delta.values() if isinstance(v, (int, float)))
-            if fb < 0.01:
-                violations.append(("C4_Reality", 0.01 - fb))
-        if len(trace) >= 2:
-            recent    = trace.get_recent(2)
-            prev      = recent[-2]
-            prev_P    = prev["P"]
-            prev_conf = prev["S"] + prev["I"]
-            curr_conf = state.S + state.I
-            if state.P < prev_P and curr_conf < prev_conf:
-                violations.append(("C5_Attribution", min(prev_P - state.P, 1.0)))
-        if state.S < 0.3:
-            violations.append(("C6_Agenthood", 0.3 - state.S))
-        if abs(state.A - 0.7) > 0.4:
-            violations.append(("C7_GlobalCoherence", abs(state.A - 0.7) - 0.4))
-        return violations
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Trajectory manifold — unchanged from v15.3
@@ -1469,6 +1617,62 @@ JSON only. No commentary.
 """
 
 
+# ── v16.1 per-action grounding prompts ───────────────────────────────────────
+# Each prompt is minimal: context in, one token out, no reasoning.
+# The Triad has already decided what action to take and what the field needs.
+# The LLM's only job is symbol completion.
+
+NAVIGATE_GROUNDING_PROMPT = """\
+Return a single URL. Nothing else. No explanation.
+
+Current page: {current_url}
+Page title: {page_title}
+Field needs signal on: {sensing_targets}
+Available page links: {links}
+
+If the available links include one relevant to the sensing targets, return it.
+Otherwise return a URL for a page that would provide signal on those channels.
+URL only.\
+"""
+
+FILL_GROUNDING_PROMPT = """\
+Return text to enter in a form field. Nothing else. No explanation.
+
+Current page: {current_url}
+Input type: {input_type}
+Placeholder: {placeholder}
+Field needs signal on: {sensing_targets}
+
+Return the single best text to enter. Text only.\
+"""
+
+EVALUATE_GROUNDING_PROMPT = """\
+Return a JavaScript expression for Playwright's page.evaluate(). Nothing else.
+
+Current page: {current_url}
+Channels needing signal: {dark_channels}
+Desired direction: {desired_delta}
+
+The expression must return a value. Called as: await page.evaluate(EXPR)
+One expression only. No function wrapper unless necessary. No explanation.\
+"""
+
+PYTHON_GROUNDING_PROMPT = """\
+Return executable Python code. Nothing else. No explanation.
+
+Current working directory: {cwd}
+Desired substrate delta: {desired_delta}
+Channels needing signal: {sensing_targets}
+
+Requirements:
+- Store the primary result in a variable named 'result'
+- Handle exceptions internally — do not let the code raise
+- Minimal code only — achieve the delta, nothing more
+
+Code only. No markdown. No explanation.\
+"""
+
+
 def _format_shapes_block(shapes: List) -> str:
     """
     Format shape list for the LLM prompt.
@@ -1605,6 +1809,108 @@ class SymbolGroundingAdapter:
                 **context,
             },
         )
+
+    def ground_symbol(self,
+                      action_type:  str,
+                      spec:         GroundingSpec,
+                      affordances:  Dict,
+                      ) -> Optional[str]:
+        """
+        v16.1: Fill a single symbolic blank for an action the field geometry selected.
+
+        The Triad has already decided:
+          - WHAT type of action to take (action_type)
+          - WHY: which channels need signal (spec.dark_channels / desired_delta)
+
+        This method returns the concrete token that action needs:
+          navigate → URL string
+          fill     → text string
+          type     → text string
+          evaluate → JavaScript expression string
+          python   → Python code string
+
+        Returns None on any failure. Caller falls back to observe.
+
+        Each prompt is < 100 tokens in. Output is one token or short expression.
+        No reasoning requested. No explanation permitted.
+        Not called from the micro-perturbation loop (grounding_spec=None gates that).
+        """
+        self.call_count += 1
+        links_json = json.dumps(affordances.get('links', [])[:10])
+
+        try:
+            if action_type == 'navigate':
+                prompt = NAVIGATE_GROUNDING_PROMPT.format(
+                    current_url     = spec.current_url,
+                    page_title      = spec.page_title,
+                    sensing_targets = spec.sensing_target_summary(),
+                    links           = links_json,
+                )
+                response, _ = self.llm.call(prompt)
+                url = response.strip().split()[0] if response.strip() else ''
+                if url.startswith('http'):
+                    return url
+                return None
+
+            elif action_type in ('fill', 'type'):
+                inputs = affordances.get('inputs', [])
+                if inputs:
+                    inp         = inputs[0]
+                    input_type  = inp.get('type', 'text')
+                    placeholder = inp.get('placeholder', '')
+                else:
+                    input_type  = 'text'
+                    placeholder = ''
+                prompt = FILL_GROUNDING_PROMPT.format(
+                    current_url     = spec.current_url,
+                    input_type      = input_type,
+                    placeholder     = placeholder,
+                    sensing_targets = spec.sensing_target_summary(),
+                )
+                response, _ = self.llm.call(prompt)
+                text = response.strip()
+                if text and len(text) < 500:
+                    return text
+                return None
+
+            elif action_type == 'evaluate':
+                prompt = EVALUATE_GROUNDING_PROMPT.format(
+                    current_url   = spec.current_url,
+                    dark_channels = ", ".join(spec.dark_channels[:5]) or "none",
+                    desired_delta = spec.desired_delta_summary(),
+                )
+                response, _ = self.llm.call(prompt)
+                code = response.strip()
+                if code.startswith('```'):
+                    code = '\n'.join(
+                        l for l in code.split('\n') if not l.startswith('```')
+                    ).strip()
+                if code:
+                    return code
+                return None
+
+            elif action_type == 'python':
+                import os
+                prompt = PYTHON_GROUNDING_PROMPT.format(
+                    cwd             = os.getcwd(),
+                    desired_delta   = spec.desired_delta_summary(),
+                    sensing_targets = spec.sensing_target_summary(),
+                )
+                response, _ = self.llm.call(prompt)
+                code = response.strip()
+                if code.startswith('```'):
+                    code = '\n'.join(
+                        l for l in code.split('\n') if not l.startswith('```')
+                    ).strip()
+                if code:
+                    return code
+                return None
+
+            else:
+                return None
+
+        except Exception:
+            return None
 
     def _parse_trajectories(self, response: str) -> List[TrajectoryCandidate]:
         """Parse LLM response with progressive degradation. Unchanged from v15."""

@@ -15,7 +15,6 @@ v16 changes (import swap only):
   - All execution logic, delta computation, and DOM measurement unchanged
 
 Also contains:
-  - AttractorMonitor (detects stability windows)
   - CouplingMatrixEstimator (empirical S/I/P/A co-movement — learns from reality)
   - BrowserRealityAdapter (Playwright-based reality interface)
 """
@@ -36,75 +35,6 @@ from uii_geometry import (
     RealityAdapter,
     AgentHandler, AVAILABLE_AGENTS,
 )
-
-class AttractorMonitor:
-    """
-    Minimal basin stability detection.
-
-    Freeze = |ΔΦ| < ε for N consecutive steps AND no CRK violations
-
-    That's it. No hashing, no identity lock, no cryptographic ontology.
-    Just: are we in a stable basin?
-    """
-
-    def __init__(self, stability_window: int = 10, phi_epsilon: float = 0.01):
-        self.stability_window = stability_window
-        self.phi_epsilon = phi_epsilon
-
-        self.recent_phi: deque = deque(maxlen=stability_window)
-        self.freeze_verified: bool = False
-        self.freeze_step: Optional[int] = None
-
-    def record_state_signature(self, triad_state: Dict, step_count: int) -> Tuple[bool, str]:
-        """
-        Minimal freeze detection: basin stability only.
-
-        Returns:
-            (freeze_verified, status_message)
-        """
-        current_phi = triad_state.get('phi', 0.0)
-        crk_violations = triad_state.get('crk_violations', [])
-
-        self.recent_phi.append(current_phi)
-
-        if len(self.recent_phi) < self.stability_window:
-            return (False, "accumulating_stability_data")
-
-        phi_stable = True
-        for i in range(1, len(self.recent_phi)):
-            delta_phi = abs(self.recent_phi[i] - self.recent_phi[i-1])
-            if delta_phi > self.phi_epsilon:
-                phi_stable = False
-                break
-
-        constraints_satisfied = len(crk_violations) == 0
-
-        if phi_stable and constraints_satisfied:
-            if not self.freeze_verified:
-                self.freeze_verified = True
-                self.freeze_step = step_count
-                return (True, f"freeze_verified_step_{step_count}")
-            return (True, "freeze_verified")
-
-        if self.freeze_verified and not phi_stable:
-            self.freeze_verified = False
-            return (False, "freeze_lost_phi_unstable")
-
-        if self.freeze_verified and not constraints_satisfied:
-            self.freeze_verified = False
-            return (False, "freeze_lost_crk_violation")
-
-        return (False, "basin_unstable")
-
-    def get_identity_hash(self) -> Optional[str]:
-        """Deprecated - no identity hash in minimal version"""
-        return None
-
-
-# ============================================================
-# MODULE 1: SMO & SUBSTRATE INFRASTRUCTURE
-# ============================================================
-
 
 # ============================================================
 # COUPLING MATRIX ESTIMATOR
@@ -238,7 +168,7 @@ class BrowserRealityAdapter(RealityAdapter):
     Browser-based reality interface via Playwright.
 
     v14: response_latency_ms added to context for ResidualTracker.
-    Python affordance ungated (v13.4+). freeze_verified does not gate execution.
+    Python affordance ungated (v13.4+).
     """
 
     def __init__(self, base_delta: float = 0.03, headless: bool = True,
@@ -252,11 +182,6 @@ class BrowserRealityAdapter(RealityAdapter):
         self._ever_navigated: bool = False
 
         self.volatility_history: deque = deque(maxlen=10)
-        # self.latency_history: deque = deque(maxlen=10) removed 
-        # complexity_history removed v14.2: was tracking element_count variance,
-        # which is an INTERFACE_COUPLED_SIGNAL and drove I structurally negative.
-
-        self.attractor_monitor_ref: Optional[AttractorMonitor] = None
 
         from playwright.sync_api import sync_playwright
         self._init_browser()
@@ -277,17 +202,40 @@ class BrowserRealityAdapter(RealityAdapter):
         self.page = self.context.new_page()
 
         try:
-            self.page.goto(self.start_url, wait_until='domcontentloaded', timeout=30000)
+            # v16.1: networkidle ensures JS-rendered links are present before
+            # the first affordance query. domcontentloaded fires before JS
+            # hydration on SPAs like Zenodo, leaving links=[] every step.
+            self.page.goto(self.start_url, wait_until='networkidle', timeout=15000)
             self._ever_navigated = True
         except Exception as e:
-            print(f"[REALITY] Warning: start_url navigation failed ({e}). "
-                  f"Browser ready — CNS must navigate before links are available.")
+            # networkidle timeout is non-fatal — page may still be usable.
+            try:
+                self.page.wait_for_load_state('domcontentloaded', timeout=5000)
+                self._ever_navigated = True
+            except Exception:
+                print(f"[REALITY] Warning: start_url navigation failed ({e}). "
+                      f"Browser ready — CNS must navigate before links are available.")
 
         self.initialized = True
 
     def get_current_affordances(self) -> Dict:
-        """Extract all executable actions from current DOM state."""
+        """Extract all executable actions from current DOM state.
+
+        v16.1 changes:
+        - Brief stabilization wait so JS-rendered content has time to appear.
+        - Link visibility: offsetWidth > 0 || offsetHeight > 0 replaces
+          offsetParent !== null. offsetParent fails for links in position:fixed,
+          sticky headers, and overflow:hidden ancestors — common on modern SPAs.
+          offsetWidth/Height is a direct layout measurement, correct in all cases.
+        - Self-links excluded: l.url !== window.location.href.
+        """
         try:
+            # Brief stabilization wait — improves link detection on JS-heavy pages
+            try:
+                self.page.wait_for_load_state('domcontentloaded', timeout=1000)
+            except Exception:
+                pass
+
             current_url = self.page.url
 
             if current_url == 'about:blank' and not self._ever_navigated:
@@ -311,9 +259,13 @@ class BrowserRealityAdapter(RealityAdapter):
                     .map(a => ({
                         url: a.href,
                         text: a.innerText.trim().slice(0, 100),
-                        visible: a.offsetParent !== null
+                        visible: (a.offsetWidth > 0 || a.offsetHeight > 0)
                     }))
-                    .filter(l => l.visible && l.url.startsWith('http'))
+                    .filter(l =>
+                        l.visible &&
+                        l.url.startsWith('http') &&
+                        l.url !== window.location.href
+                    )
                     .slice(0, 50);
 
                 const buttons = Array.from(document.querySelectorAll(
@@ -535,7 +487,15 @@ class BrowserRealityAdapter(RealityAdapter):
                 url = params.get('url')
                 if not url:
                     raise ValueError("Navigate requires 'url'")
-                self.page.goto(url, wait_until='domcontentloaded', timeout=5000)
+                # v16.1: networkidle ensures JS-rendered links are present
+                # after navigation. Falls back gracefully if timeout.
+                try:
+                    self.page.goto(url, wait_until='networkidle', timeout=10000)
+                except Exception:
+                    try:
+                        self.page.wait_for_load_state('domcontentloaded', timeout=3000)
+                    except Exception:
+                        pass  # Page is where it is — proceed with whatever loaded
 
             elif action_type == 'click':
                 selector = params.get('selector', 'a')
